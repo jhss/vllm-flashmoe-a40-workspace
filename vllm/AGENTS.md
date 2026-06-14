@@ -163,13 +163,19 @@ for these opt-in flags:
 - `VLLM_MOE_TRITON_TOPK8_SUM`
 - `VLLM_MOE_TRITON_W2_REDUCE_FUSION`
 
-Known measurements:
+Known measurements on A100 SXM BF16 top-k=8 experiments:
 
-- DeepEP HT top-k remap and AG/RS in-place combine were small wins.
-- Standalone top-k=8 `moe_sum` replacement helps only at larger token counts
-  and did not move end-to-end AG/RS latency.
-- W2 atomic epilogue reduce was correct with FP32 accumulation but slower than
-  the existing `intermediate_cache3 + moe_sum` path.
+- DeepEP HT Triton top-k remap: receiver remap `0.089 -> 0.049 ms`;
+  full forward `1.414 -> 1.386 ms`.
+- AG/RS in-place combine: finalize `0.120 -> 0.101 ms`; full forward
+  `1.178 -> 1.179 ms`, so end-to-end was noise-level.
+- Standalone top-k=8 `moe_sum` Triton path: microbench improved at large M
+  (`1024: 32.45 -> 26.97 us`, `2048: 56.54 -> 49.20 us`) but AG/RS
+  prefill `1024` did not improve (`1759.6 -> 1766.3 us`).
+- W2 atomic epilogue reduce with FP32 accumulation was correct (`max diff 0`)
+  but slower: prefill `512: 1453.0 -> 1488.1 us`, `1024: 1759.1 -> 1818.2 us`.
+  Do not keep pushing atomics; next useful path is token/top-k owner scheduling
+  or a direct W2 scheduler path that avoids atomics.
 - Nsight Compute is installed, but hardware counter profiling is blocked by
   `ERR_NVGPUCTRPERM` in this container.
 - A dangling upstream commit was found and preserved locally as branch
