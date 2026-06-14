@@ -209,6 +209,9 @@ cython_debug/
 
 # Results
 *.csv
+*.nsys-rep
+*.sqlite
+benchmarks/results/triton_cache*/
 
 # Python pickle files
 *.pkl

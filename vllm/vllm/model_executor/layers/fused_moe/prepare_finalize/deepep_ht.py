@@ -5,6 +5,7 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -12,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
@@ -23,6 +25,50 @@ from vllm.v1.worker.ubatching import (
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
+
+
+@triton.jit
+def _deepep_ht_topk_remap_kernel(
+    topk_ids,
+    numel: tl.constexpr,
+    rank_expert_offset: tl.constexpr,
+    invalid_expert_id: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < numel
+    values = tl.load(topk_ids + offsets, mask=mask)
+    values = tl.where(values == -1, invalid_expert_id, values + rank_expert_offset)
+    tl.store(topk_ids + offsets, values, mask=mask)
+
+
+def remap_deepep_ht_topk_ids(
+    expert_topk_ids: torch.Tensor,
+    invalid_expert_id: int,
+    rank_expert_offset: int,
+) -> torch.Tensor:
+    if (
+        envs.VLLM_DEEPEP_HT_TRITON_TOPK_REMAP
+        and expert_topk_ids.is_cuda
+        and expert_topk_ids.is_contiguous()
+        and expert_topk_ids.numel() > 0
+    ):
+        block_size = 256
+        grid = (triton.cdiv(expert_topk_ids.numel(), block_size),)
+        _deepep_ht_topk_remap_kernel[grid](
+            expert_topk_ids,
+            expert_topk_ids.numel(),
+            rank_expert_offset,
+            invalid_expert_id,
+            block_size,
+        )
+        return expert_topk_ids
+
+    return torch.where(
+        expert_topk_ids == -1,
+        invalid_expert_id,
+        expert_topk_ids + rank_expert_offset,
+    )
 
 
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -59,6 +105,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.dp_size = dp_size
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
+        self._local_expert_maps: dict[tuple[torch.device, int], torch.Tensor] = {}
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -83,6 +130,36 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int64
+
+    def _get_local_expert_map(
+        self, device: torch.device, local_num_experts: int
+    ) -> torch.Tensor:
+        key = (device, local_num_experts)
+        expert_map = self._local_expert_maps.get(key)
+        if expert_map is None:
+            expert_map = torch.empty(
+                local_num_experts + 1, dtype=torch.int32, device=device
+            )
+            expert_map[:-1] = torch.arange(
+                local_num_experts, dtype=torch.int32, device=device
+            )
+            expert_map[-1] = -1
+            self._local_expert_maps[key] = expert_map
+        return expert_map
+
+    def expert_assignment_params(
+        self,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_map: torch.Tensor | None,
+        device: torch.device,
+    ) -> tuple[int, torch.Tensor | None]:
+        if not envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
+            return global_num_experts, expert_map
+        return (
+            local_num_experts + 1,
+            self._get_local_expert_map(device, local_num_experts),
+        )
 
     def _get_dispatch_config(self) -> deep_ep.Config | None:
         if self.num_dispatchers_ not in self.available_rank_configs:
@@ -201,23 +278,31 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             expert_x, expert_x_scale = token_data, None
 
-        # The existing MOE kernels assume that all entries of topk_ids are
-        # valid. To that effect, set the -1s in expert_topk_ids to some expert
-        # outside this rank so the expert_map can remap it to -1 when safe.
-        # With Expert Parallel, the experts are divided amongst the rank
-        # sequentially. For rank 0, set it to num_experts - 1 and for all other
-        # ranks set it to 0 as we know that expert_map will have a -1 in those
-        # regions for those ranks.
-        #
-        # DeepEP's topk_ids output refers to the local experts directly. Offset
-        # the topk_ids to move it back to the global experts space so it aligns
-        # with existing vLLM interfaces.
         assert expert_topk_ids is not None
-        expert_topk_ids = torch.where(
-            expert_topk_ids == -1,
-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
-            expert_topk_ids + self.rank_expert_offset,
-        )
+        if envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
+            local_num_experts = len(expert_num_tokens_per_expert_list)
+            expert_topk_ids = remap_deepep_ht_topk_ids(
+                expert_topk_ids,
+                local_num_experts,
+                0,
+            )
+        else:
+            # The existing MOE kernels assume that all entries of topk_ids are
+            # valid. To that effect, set the -1s in expert_topk_ids to some
+            # expert outside this rank so the expert_map can remap it to -1.
+            # With Expert Parallel, the experts are divided amongst the rank
+            # sequentially. For rank 0, set it to num_experts - 1 and for all
+            # other ranks set it to 0 as we know that expert_map will have a
+            # -1 in those regions for those ranks.
+            #
+            # DeepEP's topk_ids output refers to the local experts directly.
+            # Offset the topk_ids to move it back to the global experts space.
+            invalid_expert_id = num_experts - 1 if self.rank_expert_offset == 0 else 0
+            expert_topk_ids = remap_deepep_ht_topk_ids(
+                expert_topk_ids,
+                invalid_expert_id,
+                self.rank_expert_offset,
+            )
 
         # Makes a GPU-CPU copy.
         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens

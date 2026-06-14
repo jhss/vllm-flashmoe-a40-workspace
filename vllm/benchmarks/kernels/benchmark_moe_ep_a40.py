@@ -4,13 +4,16 @@
 """Small MoE EP profiler for PCIe-only 2-GPU systems.
 
 This benchmark intentionally uses the real FusedMoE layer path instead of
-calling only the raw Triton expert kernel. It is meant to separate:
+calling only the raw Triton expert kernel. For backends that expose raw
+EP-group dispatch/combine, it is meant to separate:
 
 * local routing/expert compute cost,
 * allgather dispatch cost, and
 * reduce-scatter combine cost
 
-for the allgather_reducescatter EP backend.
+For backends such as DeepEP high-throughput, communication is driven through
+the FusedMoE prepare/finalize path and raw EP-group dispatch/combine timings
+are reported as null.
 """
 
 from __future__ import annotations
@@ -18,8 +21,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -72,6 +77,11 @@ class BenchResult:
     topk_us: float | None
     dispatch_us: float | None
     combine_us: float | None
+    expert_tokens_min: int
+    expert_tokens_max: int
+    expert_tokens_mean: float
+    expert_tokens_cv: float
+    expert_tokens_zero: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +97,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--csv", action="store_true")
+    parser.add_argument(
+        "--section-profile-iters",
+        type=int,
+        default=0,
+        help=(
+            "Run extra synchronized forward passes with high-level MoE section "
+            "timers. This perturbs overlap and is intended for diagnosis only."
+        ),
+    )
+    parser.add_argument("--section-profile-warmup", type=int, default=2)
+    parser.add_argument("--section-profile-output", type=Path)
+    parser.add_argument(
+        "--phase-name",
+        default="single",
+        help="Label written to profile outputs, e.g. prefill or decode.",
+    )
+    parser.add_argument(
+        "--torch-profile-iters",
+        type=int,
+        default=0,
+        help=(
+            "Run extra forward passes under torch.profiler and write a compact "
+            "CUDA kernel summary. This is a lightweight fallback when Nsight "
+            "Compute/Systems are not installed."
+        ),
+    )
+    parser.add_argument("--torch-profile-warmup", type=int, default=2)
+    parser.add_argument("--torch-profile-output", type=Path)
+    parser.add_argument(
+        "--torch-profile-top-kernels",
+        type=int,
+        default=30,
+        help="Number of CUDA events to keep in the torch profiler summary.",
+    )
+    parser.add_argument(
+        "--torch-profile-chrome-trace",
+        action="store_true",
+        help="Also export a Chrome trace next to the JSON summary.",
+    )
     return parser.parse_args()
 
 
@@ -237,6 +286,399 @@ def time_cuda(fn: Callable[[], object], warmup: int, iters: int) -> float:
     return start.elapsed_time(end) * 1000.0 / iters
 
 
+def expert_token_stats(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[int, int, float, float, int]:
+    counts = torch.bincount(
+        topk_ids.flatten().to(torch.int64),
+        minlength=num_experts,
+    ).to(torch.float32)
+    mean = counts.mean()
+    cv = counts.std(unbiased=False) / mean if mean > 0 else counts.new_tensor(0.0)
+    return (
+        int(counts.min().item()),
+        int(counts.max().item()),
+        float(mean.item()),
+        float(cv.item()),
+        int((counts == 0).sum().item()),
+    )
+
+
+class SectionProfiler:
+
+    def __init__(self) -> None:
+        self.samples_ms: dict[str, list[float]] = {}
+
+    @contextmanager
+    def section(self, name: str):
+        torch.accelerator.synchronize()
+        torch.cuda.nvtx.range_push(name)
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            torch.accelerator.synchronize()
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            torch.cuda.nvtx.range_pop()
+            self.samples_ms.setdefault(name, []).append(elapsed_ms)
+
+    def summary(self) -> dict[str, dict[str, float | int]]:
+        summarized = {}
+        for name, values in sorted(self.samples_ms.items()):
+            summarized[name] = {
+                "count": len(values),
+                "avg_ms": sum(values) / len(values),
+                "min_ms": min(values),
+                "max_ms": max(values),
+            }
+        return summarized
+
+
+_SECTION_PROFILER: SectionProfiler | None = None
+
+
+def _wrap_profiled_method(cls: type, method_name: str, section_name: str) -> None:
+    original_attr = f"_moe_ep_profile_original_{method_name}"
+    if hasattr(cls, original_attr):
+        return
+
+    original = getattr(cls, method_name)
+
+    def wrapped(self, *args, **kwargs):
+        profiler = _SECTION_PROFILER
+        if profiler is None:
+            return original(self, *args, **kwargs)
+        with profiler.section(section_name):
+            return original(self, *args, **kwargs)
+
+    setattr(cls, original_attr, original)
+    setattr(cls, method_name, wrapped)
+
+
+def install_section_profilers() -> None:
+    from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+
+    _wrap_profiled_method(
+        mk.FusedMoEKernelModularImpl, "_prepare", "moe_prepare_total"
+    )
+    _wrap_profiled_method(
+        mk.FusedMoEKernelModularImpl, "_fused_experts", "moe_experts_total"
+    )
+    _wrap_profiled_method(
+        mk.FusedMoEKernelModularImpl, "_finalize", "moe_finalize_total"
+    )
+    _wrap_profiled_method(
+        naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular,
+        "prepare",
+        "agrs_prepare_dispatch",
+    )
+    _wrap_profiled_method(
+        naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular,
+        "finalize",
+        "agrs_finalize_combine",
+    )
+
+    try:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize import deepep_ht
+    except ImportError:
+        return
+
+    _wrap_deepep_ht_receiver_details(
+        deepep_ht.DeepEPHTPrepareAndFinalize,
+        deepep_ht,
+        mk,
+    )
+    _wrap_deepep_ht_dispatch(deepep_ht.DeepEPHTPrepareAndFinalize)
+    _wrap_deepep_ht_finalize(deepep_ht.DeepEPHTPrepareAndFinalize)
+
+
+def _wrap_deepep_ht_receiver_details(
+    cls: type,
+    deepep_ht_module,
+    mk_module,
+) -> None:
+    original_attr = "_moe_ep_profile_original__receiver"
+    if hasattr(cls, original_attr):
+        return
+
+    original = getattr(cls, "_receiver")
+
+    def wrapped(
+        self,
+        event,
+        has_scales: bool,
+        token_data: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
+        expert_topk_ids: torch.Tensor | None,
+        num_experts: int,
+        expert_num_tokens_per_expert_list: list[int],
+        expert_topk_weights: torch.Tensor | None,
+        a1_scale: torch.Tensor | None,
+        quant_config,
+        defer_input_quant: bool,
+    ):
+        profiler = _SECTION_PROFILER
+        if profiler is None:
+            return original(
+                self,
+                event,
+                has_scales,
+                token_data,
+                expert_topk_ids,
+                num_experts,
+                expert_num_tokens_per_expert_list,
+                expert_topk_weights,
+                a1_scale,
+                quant_config,
+                defer_input_quant,
+            )
+
+        with profiler.section("deepep_receiver_wait"):
+            if event.event is not None:
+                event.current_stream_wait()
+
+        with profiler.section("deepep_receiver_unpack"):
+            if has_scales:
+                expert_x, expert_x_scale = token_data
+            else:
+                expert_x, expert_x_scale = token_data, None
+
+        with profiler.section("deepep_receiver_topk_remap"):
+            assert expert_topk_ids is not None
+            if deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
+                invalid_expert_id = len(expert_num_tokens_per_expert_list)
+                rank_expert_offset = 0
+            else:
+                invalid_expert_id = (
+                    num_experts - 1 if self.rank_expert_offset == 0 else 0
+                )
+                rank_expert_offset = self.rank_expert_offset
+            expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
+                expert_topk_ids,
+                invalid_expert_id,
+                rank_expert_offset,
+            )
+
+        with profiler.section("deepep_receiver_metadata"):
+            expert_tokens_meta = mk_module.ExpertTokensMetadata.make_from_list(
+                expert_num_tokens_per_expert_list, device=expert_x.device
+            )
+
+        if not quant_config.is_block_quantized and not defer_input_quant:
+            with profiler.section("deepep_receiver_post_quant"):
+                expert_x_scale = None
+                if expert_x.numel() != 0:
+                    expert_x, expert_x_scale = (
+                        deepep_ht_module.moe_kernel_quantize_input(
+                            expert_x,
+                            a1_scale,
+                            quant_dtype=quant_config.quant_dtype,
+                            per_act_token_quant=False,
+                            block_shape=quant_config.block_shape,
+                            is_scale_swizzled=quant_config.is_scale_swizzled,
+                        )
+                    )
+
+        return (
+            expert_x,
+            expert_x_scale,
+            expert_tokens_meta,
+            expert_topk_ids,
+            expert_topk_weights,
+        )
+
+    setattr(cls, original_attr, original)
+    setattr(cls, "_receiver", wrapped)
+
+
+def _wrap_deepep_ht_dispatch(cls: type) -> None:
+    original_attr = "_moe_ep_profile_original__do_dispatch"
+    if hasattr(cls, original_attr):
+        return
+
+    original = getattr(cls, "_do_dispatch")
+
+    def wrapped(self, *args, **kwargs):
+        profiler = _SECTION_PROFILER
+        if profiler is None:
+            return original(self, *args, **kwargs)
+        with profiler.section("deepep_dispatch_submit"):
+            receiver = original(self, *args, **kwargs)
+
+        def profiled_receiver():
+            active_profiler = _SECTION_PROFILER
+            if active_profiler is None:
+                return receiver()
+            with active_profiler.section("deepep_dispatch_receiver"):
+                return receiver()
+
+        return profiled_receiver
+
+    setattr(cls, original_attr, original)
+    setattr(cls, "_do_dispatch", wrapped)
+
+
+def _wrap_deepep_ht_finalize(cls: type) -> None:
+    original_attr = "_moe_ep_profile_original__finalize"
+    if hasattr(cls, original_attr):
+        return
+
+    original = getattr(cls, "_finalize")
+
+    def wrapped(self, *args, **kwargs):
+        profiler = _SECTION_PROFILER
+        if profiler is None:
+            return original(self, *args, **kwargs)
+        with profiler.section("deepep_combine_submit"):
+            receiver = original(self, *args, **kwargs)
+        if receiver is None:
+            return None
+
+        def profiled_receiver():
+            active_profiler = _SECTION_PROFILER
+            if active_profiler is None:
+                return receiver()
+            with active_profiler.section("deepep_combine_receiver_copy"):
+                return receiver()
+
+        return profiled_receiver
+
+    setattr(cls, original_attr, original)
+    setattr(cls, "_finalize", wrapped)
+
+
+def section_profile_path(base: Path, rank: int) -> Path:
+    return base.with_name(f"{base.stem}.rank{rank}{base.suffix}")
+
+
+def run_section_profile(
+    args: argparse.Namespace,
+    rank: int,
+    forward_once: Callable[[], object],
+) -> None:
+    global _SECTION_PROFILER
+
+    if args.section_profile_iters <= 0:
+        return
+    if args.section_profile_output is None:
+        raise ValueError("--section-profile-output is required for section profiling")
+
+    install_section_profilers()
+    for _ in range(args.section_profile_warmup):
+        forward_once()
+    torch.accelerator.synchronize()
+
+    profiler = SectionProfiler()
+    _SECTION_PROFILER = profiler
+    try:
+        for _ in range(args.section_profile_iters):
+            forward_once()
+        torch.accelerator.synchronize()
+    finally:
+        _SECTION_PROFILER = None
+
+    output_path = section_profile_path(args.section_profile_output, rank)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "rank": rank,
+        "world_size": args.world_size,
+        "backend": args.backend,
+        "tokens": args.tokens,
+        "hidden_size": args.hidden_size,
+        "intermediate_size": args.intermediate_size,
+        "num_experts": args.num_experts,
+        "top_k": args.top_k,
+        "warmup": args.section_profile_warmup,
+        "iters": args.section_profile_iters,
+        "sections": profiler.summary(),
+    }
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _profiler_event_time_us(event, *names: str) -> float:
+    for name in names:
+        value = getattr(event, name, None)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def run_torch_kernel_profile(
+    args: argparse.Namespace,
+    rank: int,
+    forward_once: Callable[[], object],
+) -> None:
+    if args.torch_profile_iters <= 0:
+        return
+    if args.torch_profile_output is None:
+        raise ValueError("--torch-profile-output is required for torch profiling")
+
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    for _ in range(args.torch_profile_warmup):
+        forward_once()
+    torch.accelerator.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        with record_function(f"moe_ep_forward_{args.phase_name}"):
+            for _ in range(args.torch_profile_iters):
+                forward_once()
+        torch.accelerator.synchronize()
+
+    events = []
+    total_cuda_us = 0.0
+    for event in prof.key_averages():
+        cuda_total_us = _profiler_event_time_us(
+            event, "device_time_total", "cuda_time_total"
+        )
+        cuda_self_us = _profiler_event_time_us(
+            event, "self_device_time_total", "self_cuda_time_total"
+        )
+        if cuda_total_us <= 0.0 and cuda_self_us <= 0.0:
+            continue
+        total_cuda_us += cuda_self_us
+        events.append(
+            {
+                "name": event.key,
+                "count": int(event.count),
+                "cuda_total_us": cuda_total_us,
+                "cuda_self_us": cuda_self_us,
+                "cpu_total_us": float(getattr(event, "cpu_time_total", 0.0)),
+                "cpu_self_us": float(getattr(event, "self_cpu_time_total", 0.0)),
+            }
+        )
+
+    events.sort(key=lambda item: item["cuda_total_us"], reverse=True)
+    output_path = section_profile_path(args.torch_profile_output, rank)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "rank": rank,
+        "world_size": args.world_size,
+        "backend": args.backend,
+        "phase_name": args.phase_name,
+        "tokens": args.tokens,
+        "hidden_size": args.hidden_size,
+        "intermediate_size": args.intermediate_size,
+        "num_experts": args.num_experts,
+        "top_k": args.top_k,
+        "warmup": args.torch_profile_warmup,
+        "iters": args.torch_profile_iters,
+        "total_cuda_self_us": total_cuda_us,
+        "top_cuda_events": events[: args.torch_profile_top_kernels],
+    }
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+    if args.torch_profile_chrome_trace:
+        trace_path = output_path.with_suffix(output_path.suffix + ".trace.json")
+        prof.export_chrome_trace(str(trace_path))
+
+
 def run_worker(
     local_rank: int,
     args: argparse.Namespace,
@@ -260,6 +702,8 @@ def run_worker(
                 return layer(hidden_states, router_logits)
 
         full_forward_us = time_cuda(forward_once, args.warmup, args.iters)
+        run_section_profile(args, rank, forward_once)
+        run_torch_kernel_profile(args, rank, forward_once)
 
         topk_us: float | None = None
         dispatch_us: float | None = None
@@ -274,6 +718,13 @@ def run_worker(
 
         topk_us = time_cuda(topk_once, args.warmup, args.iters)
         topk_weights, topk_ids = topk_once()
+        (
+            expert_tokens_min,
+            expert_tokens_max,
+            expert_tokens_mean,
+            expert_tokens_cv,
+            expert_tokens_zero,
+        ) = expert_token_stats(topk_ids, args.num_experts)
         torch.accelerator.synchronize()
 
         if args.world_size > 1:
@@ -287,25 +738,29 @@ def run_worker(
                         is_sequence_parallel=False,
                     )
 
-            dispatch_us = time_cuda(dispatch_once, args.warmup, args.iters)
-            with make_forward_context(args, vllm_config, device):
-                dispatched_hidden, _, _ = get_ep_group().dispatch(
-                    hidden_states,
-                    topk_weights,
-                    topk_ids,
-                    is_sequence_parallel=False,
-                )
-            combine_input = torch.randn_like(dispatched_hidden)
-            torch.accelerator.synchronize()
-
-            def combine_once():
+            try:
+                dispatch_us = time_cuda(dispatch_once, args.warmup, args.iters)
                 with make_forward_context(args, vllm_config, device):
-                    return get_ep_group().combine(
-                        combine_input,
+                    dispatched_hidden, _, _ = get_ep_group().dispatch(
+                        hidden_states,
+                        topk_weights,
+                        topk_ids,
                         is_sequence_parallel=False,
                     )
+                combine_input = torch.randn_like(dispatched_hidden)
+                torch.accelerator.synchronize()
 
-            combine_us = time_cuda(combine_once, args.warmup, args.iters)
+                def combine_once():
+                    with make_forward_context(args, vllm_config, device):
+                        return get_ep_group().combine(
+                            combine_input,
+                            is_sequence_parallel=False,
+                        )
+
+                combine_us = time_cuda(combine_once, args.warmup, args.iters)
+            except NotImplementedError:
+                dispatch_us = None
+                combine_us = None
 
         result = BenchResult(
             rank=rank,
@@ -324,6 +779,11 @@ def run_worker(
             topk_us=topk_us,
             dispatch_us=dispatch_us,
             combine_us=combine_us,
+            expert_tokens_min=expert_tokens_min,
+            expert_tokens_max=expert_tokens_max,
+            expert_tokens_mean=expert_tokens_mean,
+            expert_tokens_cv=expert_tokens_cv,
+            expert_tokens_zero=expert_tokens_zero,
         )
 
         torch.distributed.barrier()

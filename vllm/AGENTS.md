@@ -149,3 +149,28 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+
+---
+
+## Local Workspace Notes
+
+This fork is being used for A100 SXM MoE EP experiments. Before continuing,
+check the Korean experiment summaries under `benchmarks/results` and search
+for these opt-in flags:
+
+- `VLLM_DEEPEP_HT_TRITON_TOPK_REMAP`
+- `VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS`
+- `VLLM_MOE_TRITON_TOPK8_SUM`
+- `VLLM_MOE_TRITON_W2_REDUCE_FUSION`
+
+Known measurements:
+
+- DeepEP HT top-k remap and AG/RS in-place combine were small wins.
+- Standalone top-k=8 `moe_sum` replacement helps only at larger token counts
+  and did not move end-to-end AG/RS latency.
+- W2 atomic epilogue reduce was correct with FP32 accumulation but slower than
+  the existing `intermediate_cache3 + moe_sum` path.
+- Nsight Compute is installed, but hardware counter profiling is blocked by
+  `ERR_NVGPUCTRPERM` in this container.
+- A dangling upstream commit was found and preserved locally as branch
+  `recovered/e2bf2b3d-mm-feature-lookup`.

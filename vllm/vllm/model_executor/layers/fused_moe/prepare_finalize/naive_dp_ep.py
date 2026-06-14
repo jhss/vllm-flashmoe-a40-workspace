@@ -204,8 +204,10 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        get_ep_group().combine(
+            out,
+            is_sequence_parallel=self.is_sequence_parallel,
+            out=output,
         )
 
 

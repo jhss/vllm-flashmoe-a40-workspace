@@ -63,6 +63,46 @@ def moe_fused_mul_sum_kernel(
     )
 
 
+@triton.jit
+def moe_sum_kernel(
+    inputs_ptr,
+    outputs_ptr,
+    num_tokens: tl.constexpr,
+    stride_m: tl.constexpr,
+    top_k: tl.constexpr,
+    size: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_k = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    m_mask = offs_m < num_tokens
+    k_mask = offs_k < size
+    mask = m_mask[:, None] & k_mask[None, :]
+
+    a_base = inputs_ptr + (offs_m * stride_m)[:, None] + offs_k[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+
+    for n in tl.static_range(top_k):
+        a_vec = tl.load(
+            a_base + n * size,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc += a_vec
+
+    out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
+    tl.store(
+        out_ptrs,
+        acc.to(outputs_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
 def _heuristic_config(
     num_tokens: int,
     top_k: int,
@@ -132,6 +172,26 @@ def _heuristic_config(
     return BLOCK_M, BLOCK_K, num_warps, num_stages
 
 
+def _sum_heuristic_config(
+    num_tokens: int,
+    size: int,
+    element_size: int,
+):
+    is_fp32 = element_size > 2
+    if is_fp32:
+        BLOCK_M = 1 if num_tokens <= 512 else 2
+        BLOCK_K = min(triton.next_power_of_2(size), 256)
+        BLOCK_K = max(BLOCK_K, 64)
+        num_warps = 4
+    else:
+        BLOCK_M = 4
+        BLOCK_K = min(triton.next_power_of_2(size), 256)
+        BLOCK_K = max(BLOCK_K, 128)
+        num_warps = 4
+
+    return BLOCK_M, BLOCK_K, num_warps, 2
+
+
 def moe_fused_mul_sum(
     inputs: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -192,6 +252,87 @@ def moe_fused_mul_sum(
             top_k * size,
             expert_map is not None,
             top_k,
+            size,
+            BLOCK_M,
+            BLOCK_K,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+    return outputs
+
+
+def moe_sum_triton(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Triton reduction for MoE expert outputs that already include router
+    weights. This mirrors ops.moe_sum(input, output) for input shaped
+    (num_tokens, top_k, hidden_size).
+    """
+    assert inputs.ndim == 3
+    assert inputs.is_contiguous()
+    assert inputs.dtype in (torch.float32, torch.float16, torch.bfloat16)
+
+    num_tokens, top_k, size = inputs.shape
+    output_shape = (num_tokens, size)
+    if outputs is None:
+        outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
+
+    assert outputs.shape == output_shape
+    assert outputs.is_contiguous()
+
+    if not isinstance(inputs, FakeTensor):
+        BLOCK_M, BLOCK_K, num_warps, num_stages = _sum_heuristic_config(
+            num_tokens,
+            size,
+            inputs.element_size(),
+        )
+        grid = (triton.cdiv(size, BLOCK_K), triton.cdiv(num_tokens, BLOCK_M))
+        moe_sum_kernel[grid](
+            inputs,
+            outputs,
+            num_tokens,
+            top_k * size,
+            top_k,
+            size,
+            BLOCK_M,
+            BLOCK_K,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+    return outputs
+
+
+def moe_sum_triton_topk8(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens = inputs.size(0)
+    size = inputs.size(2)
+
+    if inputs.element_size() == 2 and size == 2048:
+        BLOCK_M = 4
+        BLOCK_K = 256
+        num_warps = 4
+        num_stages = 2
+    else:
+        BLOCK_M, BLOCK_K, num_warps, num_stages = _sum_heuristic_config(
+            num_tokens,
+            size,
+            inputs.element_size(),
+        )
+
+    if not isinstance(inputs, FakeTensor):
+        grid = (triton.cdiv(size, BLOCK_K), triton.cdiv(num_tokens, BLOCK_M))
+        moe_sum_kernel[grid](
+            inputs,
+            outputs,
+            num_tokens,
+            8 * size,
+            8,
             size,
             BLOCK_M,
             BLOCK_K,

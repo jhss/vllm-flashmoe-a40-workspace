@@ -174,6 +174,17 @@ if TYPE_CHECKING:
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
     VLLM_MOE_USE_DEEP_GEMM: bool = True
+    VLLM_MOE_TRITON_TOPK8_SUM: bool = False
+    VLLM_MOE_TRITON_TOPK8_SUM_MIN_TOKENS: int = 256
+    VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG: bool = False
+    VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS: bool = False
+    VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE: bool = False
+    VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE_MAX_TOKENS: int = 1
+    VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS: bool = False
+    VLLM_MOE_TRITON_EP_MASKED_ACTIVATION: bool = False
+    VLLM_MOE_TRITON_W2_REDUCE_FUSION: bool = False
+    VLLM_MOE_TRITON_W2_REDUCE_FUSION_MIN_TOKENS: int = 256
+    VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG: bool = False
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -235,6 +246,9 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
+    VLLM_DEEPEP_HT_NUM_SMS: int = 20
+    VLLM_DEEPEP_HT_TRITON_TOPK_REMAP: bool = False
+    VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS: bool = False
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
@@ -1403,6 +1417,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
     ),
+    # Experimental A/B path for contiguous top-k=8 MoE expert outputs.
+    "VLLM_MOE_TRITON_TOPK8_SUM": lambda: bool(
+        int(os.getenv("VLLM_MOE_TRITON_TOPK8_SUM", "0"))
+    ),
+    "VLLM_MOE_TRITON_TOPK8_SUM_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_TRITON_TOPK8_SUM_MIN_TOKENS", "256")
+    ),
+    # Experimental A100/SM80 W1/W13-only Triton config override for the
+    # Mixtral-like shape E=64/128, hidden=2048, intermediate=768, top-k=8.
+    "VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG": lambda: bool(
+        int(os.getenv("VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG", "0"))
+    ),
+    # Use a narrow A100/SM80 BF16 MoE Triton kernel-body fork for W1/W13
+    # and W2 on the benchmarked Mixtral-like shape.
+    "VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS", "0"))
+    ),
+    # Token-major W2+top-k reduce prototype for A100/SM80 BF16 decode-like
+    # small batches. This changes the W2 kernel body/schedule and writes the
+    # reduced output directly, bypassing intermediate_cache3 and moe_sum.
+    "VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE", "0"))
+    ),
+    "VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE_MAX_TOKENS", "1")
+    ),
+    # For EP Triton experts, ignore off-rank experts during expert assignment
+    # and use a masked fused final sum. This avoids launching invalid expert
+    # blocks that only write zeros. Experimental, default-off.
+    "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS", "0"))
+    ),
+    # With EP invalid expert skipping enabled, use a masked SiLU+mul kernel
+    # that avoids reading/writing activation rows for off-rank expert slots.
+    "VLLM_MOE_TRITON_EP_MASKED_ACTIVATION": lambda: bool(
+        int(os.getenv("VLLM_MOE_TRITON_EP_MASKED_ACTIVATION", "0"))
+    ),
+    # Experimental W2 epilogue path that atomically reduces top-k expert
+    # outputs directly into the final MoE output.
+    "VLLM_MOE_TRITON_W2_REDUCE_FUSION": lambda: bool(
+        int(os.getenv("VLLM_MOE_TRITON_W2_REDUCE_FUSION", "0"))
+    ),
+    "VLLM_MOE_TRITON_W2_REDUCE_FUSION_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_TRITON_W2_REDUCE_FUSION_MIN_TOKENS", "256")
+    ),
+    # Experimental A100/SM80 W2-only Triton config override for the
+    # Mixtral-like shape E=128, hidden=2048, intermediate=768, top-k=8.
+    "VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG": lambda: bool(
+        int(os.getenv("VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG", "0"))
+    ),
     # Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs.
     "VLLM_USE_DEEP_GEMM_E8M0": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_E8M0", "1"))
@@ -1701,6 +1765,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The size in MB of the buffers (NVL and RDMA) used by DeepEP
     "VLLM_DEEPEP_BUFFER_SIZE_MB": lambda: int(
         os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")
+    ),
+    # Number of SMs to use for DeepEP high-throughput kernels.
+    "VLLM_DEEPEP_HT_NUM_SMS": lambda: int(
+        os.getenv("VLLM_DEEPEP_HT_NUM_SMS", "20")
+    ),
+    # Use a benchmark-gated Triton kernel to remap DeepEP HT local top-k ids
+    # to vLLM's global expert id space in-place.
+    "VLLM_DEEPEP_HT_TRITON_TOPK_REMAP": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_TRITON_TOPK_REMAP", "0"))
+    ),
+    # Keep DeepEP HT's received top-k ids in local expert-id space and make
+    # the Triton expert-assignment path align only local experts plus a
+    # sentinel invalid expert.
+    "VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS", "0"))
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput

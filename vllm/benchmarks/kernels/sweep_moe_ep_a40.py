@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import os
 import subprocess
 import sys
@@ -111,7 +112,13 @@ BASE_FIELDNAMES = [
     "topk_us",
     "dispatch_us",
     "combine_us",
+    "expert_tokens_min",
+    "expert_tokens_max",
+    "expert_tokens_mean",
+    "expert_tokens_cv",
+    "expert_tokens_zero",
     "comm_us",
+    "comm_share",
     "full_forward_ms",
     "comm_ms",
     "speedup_vs_world1",
@@ -202,18 +209,27 @@ def as_float(row: dict[str, str], key: str) -> float | None:
 def finalize_rows(rows: list[dict[str, object]]) -> None:
     baseline: dict[tuple[str, int], float] = {}
     for row in rows:
-        if int(row["world_size"]) == 1 and int(row["returncode"]) == 0:
+        if (
+            int(row["world_size"]) == 1
+            and int(row["returncode"]) == 0
+            and row["full_forward_us"] != ""
+        ):
             baseline[(str(row["shape"]), int(row["tokens"]))] = float(
                 row["full_forward_us"]
             )
 
     for row in rows:
+        if int(row["returncode"]) != 0 or row["full_forward_us"] == "":
+            continue
         dispatch_us = row.get("dispatch_us")
         combine_us = row.get("combine_us")
         comm_us = None
         if dispatch_us not in (None, "") and combine_us not in (None, ""):
             comm_us = float(dispatch_us) + float(combine_us)
         row["comm_us"] = "" if comm_us is None else comm_us
+        row["comm_share"] = (
+            "" if comm_us is None else comm_us / float(row["full_forward_us"])
+        )
         row["full_forward_ms"] = float(row["full_forward_us"]) / 1000.0
         row["comm_ms"] = "" if comm_us is None else comm_us / 1000.0
 
@@ -248,6 +264,66 @@ def write_topology(output: Path) -> None:
         topo_path.write_text(topo.stdout + "\n" + query.stdout)
     except OSError:
         pass
+
+
+def command_output(command: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as exc:
+        return f"{command[0]} unavailable: {exc}"
+    return completed.stdout.strip()
+
+
+def write_metadata(
+    output: Path,
+    args: argparse.Namespace,
+    world_sizes: list[int],
+) -> None:
+    metadata = {
+        "created_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "script": str(Path(__file__).relative_to(REPO_ROOT)),
+        "argv": sys.argv,
+        "preset": args.preset,
+        "world_sizes": world_sizes,
+        "backend": args.backend,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "seed": args.seed,
+        "python": {
+            "executable": sys.executable,
+            "version": sys.version,
+        },
+        "git": {
+            "commit": command_output(["git", "rev-parse", "HEAD"]),
+            "status_short": command_output(["git", "status", "--short"]),
+        },
+        "env": {
+            key: os.environ.get(key, "")
+            for key in (
+                "CUDA_VISIBLE_DEVICES",
+                "NCCL_P2P_DISABLE",
+                "NCCL_DEBUG",
+                "VLLM_ALL2ALL_BACKEND",
+                "VLLM_DEEPEP_HT_NUM_SMS",
+                "VLLM_LOGGING_LEVEL",
+            )
+        },
+        "nvidia_smi": command_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,compute_cap,memory.total,driver_version",
+                "--format=csv,noheader",
+            ]
+        ),
+        "topology": command_output(["nvidia-smi", "topo", "-m"]),
+    }
+    output.with_suffix(".meta.json").write_text(json.dumps(metadata, indent=2))
 
 
 def main() -> None:
@@ -308,7 +384,13 @@ def main() -> None:
                         "topk_us": "",
                         "dispatch_us": "",
                         "combine_us": "",
+                        "expert_tokens_min": "",
+                        "expert_tokens_max": "",
+                        "expert_tokens_mean": "",
+                        "expert_tokens_cv": "",
+                        "expert_tokens_zero": "",
                         "comm_us": "",
+                        "comm_share": "",
                         "full_forward_ms": "",
                         "comm_ms": "",
                         "speedup_vs_world1": "",
@@ -328,7 +410,14 @@ def main() -> None:
                     "returncode": completed.returncode,
                 }
                 row.update(parsed)
-                for key in ("full_forward_us", "topk_us", "dispatch_us", "combine_us"):
+                for key in (
+                    "full_forward_us",
+                    "topk_us",
+                    "dispatch_us",
+                    "combine_us",
+                    "expert_tokens_mean",
+                    "expert_tokens_cv",
+                ):
                     value = as_float(row, key)
                     row[key] = "" if value is None else value
                 rows.append(row)
@@ -340,6 +429,7 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(rows)
         write_topology(output)
+        write_metadata(output, args, world_sizes)
         print(f"wrote {output}", flush=True)
 
 

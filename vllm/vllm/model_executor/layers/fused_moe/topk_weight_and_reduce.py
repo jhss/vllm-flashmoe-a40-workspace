@@ -5,6 +5,7 @@
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 
 
@@ -104,9 +105,6 @@ class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
             f"{fused_expert_output.size()}"
         )
 
-        if not apply_router_weight_on_input:
-            fused_expert_output.mul_(topk_weights.view(m, -1, 1))
-
         if output is None:
             output = torch.empty(
                 (m, k),
@@ -116,6 +114,28 @@ class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
         assert output.size() == (m, k), (
             f"Expected output size {(m, k)}. But got {output.size()}"
         )
+
+        if (
+            envs.VLLM_MOE_TRITON_TOPK8_SUM
+            and not apply_router_weight_on_input
+            and num_topk == 8
+            and m >= envs.VLLM_MOE_TRITON_TOPK8_SUM_MIN_TOKENS
+            and fused_expert_output.is_cuda
+            and fused_expert_output.is_contiguous()
+            and topk_weights.is_contiguous()
+        ):
+            from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+                moe_fused_mul_sum,
+            )
+
+            return moe_fused_mul_sum(
+                fused_expert_output,
+                topk_weights,
+                output,
+            )
+
+        if not apply_router_weight_on_input:
+            fused_expert_output.mul_(topk_weights.view(m, -1, 1))
 
         ops.moe_sum(fused_expert_output, output)
         return output

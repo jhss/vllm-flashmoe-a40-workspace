@@ -214,17 +214,19 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
 
     def combine(
-        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Combine the hidden states and router logits from the appropriate device.
         This is a no-op in the base class.
         """
         assert self.all2all_manager is not None
-        return self.all2all_manager.combine(
-            hidden_states,
-            is_sequence_parallel,
-        )
+        if out is None:
+            return self.all2all_manager.combine(hidden_states, is_sequence_parallel)
+        return self.all2all_manager.combine(hidden_states, is_sequence_parallel, out)
 
 
 class _CPUSHMDistributed:

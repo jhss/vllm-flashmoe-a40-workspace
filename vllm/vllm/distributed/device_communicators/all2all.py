@@ -123,7 +123,10 @@ class AgRsAll2AllManager(All2AllManagerBase):
         return hidden_states, topk_weights, topk_ids, gathered_tensors[3:]
 
     def combine(
-        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Reduce-scatter hidden_states across all dp ranks.
@@ -134,7 +137,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert sizes is not None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        hidden_states = dist_group.reduce_scatterv(
+            hidden_states, dim=0, sizes=sizes, out=out
+        )
         return hidden_states
 
     def destroy(self):
@@ -184,7 +189,10 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         raise NotImplementedError
 
     def combine(
-        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -202,6 +210,9 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        self.num_sms = envs.VLLM_DEEPEP_HT_NUM_SMS
+        if self.num_sms <= 0 or self.num_sms % 2 != 0:
+            raise ValueError("VLLM_DEEPEP_HT_NUM_SMS must be a positive even integer")
 
     def _make_all2all_kwargs(self) -> dict[Any, Any]:
         # Defaults for internode and intranode are taken from DeepEP tests.
@@ -239,6 +250,7 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
         import deep_ep  # type: ignore[import-not-found]
 
         buffer_kwargs = self._make_all2all_kwargs()
+        deep_ep.Buffer.set_num_sms(self.num_sms)
         logger.debug("DeepEP all2all args %s", buffer_kwargs)
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.Buffer

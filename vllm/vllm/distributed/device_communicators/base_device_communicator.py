@@ -108,7 +108,12 @@ class All2AllManagerBase:
     def max_sms_used(self) -> int | None:
         return None  # None means it could use the whole GPU
 
-    def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
+    ):
         raise NotImplementedError
 
     def destroy(self):
@@ -248,7 +253,11 @@ class DeviceCommunicatorBase:
         return output_tensor.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
-        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -361,12 +370,18 @@ class DeviceCommunicatorBase:
         return hidden_states, topk_weights, topk_ids
 
     def combine(
-        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Combine the hidden states and router logits from the appropriate device.
         This is a no-op in the base class.
         """
+        if out is not None:
+            out.copy_(hidden_states)
+            return out
         return hidden_states
 
     def batch_isend_irecv(self, p2p_ops: list):

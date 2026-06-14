@@ -337,12 +337,14 @@ def fused_moe_kernel(
     SPLIT_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
+    output_top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    FUSED_TOPK_REDUCE: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -413,6 +415,8 @@ def fused_moe_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
+        if FUSED_TOPK_REDUCE:
+            return
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -548,9 +552,18 @@ def fused_moe_kernel(
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    if FUSED_TOPK_REDUCE:
+        offs_out_token = offs_token // output_top_k
+    else:
+        offs_out_token = offs_token
+    c_ptrs = (
+        c_ptr + stride_cm * offs_out_token[:, None] + stride_cn * offs_cn[None, :]
+    )
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if FUSED_TOPK_REDUCE:
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+    else:
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 # NOTE(zyongye): we can remove all the wna16 kernel
@@ -724,6 +737,8 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    fused_topk_reduce: bool = False,
+    fused_topk_reduce_top_k: int | None = None,
 ):
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
@@ -746,6 +761,9 @@ def invoke_fused_moe_triton_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+    output_top_k = (
+        top_k if fused_topk_reduce_top_k is None else fused_topk_reduce_top_k
+    )
     if sorted_token_ids is not None:
         EM = sorted_token_ids.size(0)
         if A.size(0) < config["BLOCK_SIZE_M"]:
@@ -763,6 +781,8 @@ def invoke_fused_moe_triton_kernel(
         * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
     )
     HAS_BIAS = B_bias is not None
+    stride_cm = C.stride(0) if fused_topk_reduce else C.stride(1)
+    stride_cn = C.stride(1) if fused_topk_reduce else C.stride(2)
 
     config = config.copy()
     config["SPLIT_K"] = 1
@@ -789,8 +809,8 @@ def invoke_fused_moe_triton_kernel(
         B.stride(0),
         B.stride(2),
         B.stride(1),
-        C.stride(1),
-        C.stride(2),
+        stride_cm,
+        stride_cn,
         A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
         A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
         B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
@@ -802,6 +822,7 @@ def invoke_fused_moe_triton_kernel(
         0 if block_shape is None else block_shape[1],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
+        output_top_k=output_top_k,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -809,6 +830,7 @@ def invoke_fused_moe_triton_kernel(
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
+        FUSED_TOPK_REDUCE=fused_topk_reduce,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         **config,
     )

@@ -6,11 +6,16 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.a100_moe_kernels import (
+    invoke_a100_bf16_moe_kernel,
+    invoke_a100_bf16_w2_token_major_reduce_kernel,
 )
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
@@ -23,6 +28,13 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
+)
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+    moe_fused_mul_sum,
+    moe_sum_triton_topk8,
+)
+from vllm.model_executor.layers.fused_moe.moe_masked_activation import (
+    moe_ep_masked_silu_and_mul,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -49,6 +61,289 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+
+def _a100_moe_tuned_config(config: dict[str, int]) -> dict[str, int]:
+    tuned_config = dict(config)
+    tuned_config.update(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "SPLIT_K": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    )
+    return tuned_config
+
+
+def _is_a100_tuned_common_shape(
+    *,
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+) -> bool:
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(80):
+        return False
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    if lora_enabled or block_shape is not None:
+        return False
+    if top_k_num != 8 or num_tokens < 1024:
+        return False
+    return not (
+        quant_config.use_fp8_w8a8
+        or quant_config.use_int8_w8a8
+        or quant_config.use_int8_w8a16
+        or quant_config.use_int4_w4a16
+    )
+
+
+def _maybe_get_a100_w1_config(
+    config: dict[str, int],
+    *,
+    w1: torch.Tensor,
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+) -> dict[str, int]:
+    if not (
+        envs.VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG
+        or envs.VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS
+    ):
+        return config
+    if not _is_a100_tuned_common_shape(
+        hidden_states=hidden_states,
+        num_tokens=num_tokens,
+        top_k_num=top_k_num,
+        quant_config=quant_config,
+        block_shape=block_shape,
+        lora_enabled=lora_enabled,
+    ):
+        return config
+    if (
+        w1.dim() != 3
+        or w1.shape[0] not in (64, 128)
+        or tuple(w1.shape[1:]) != (1536, 2048)
+    ):
+        return config
+    return _a100_moe_tuned_config(config)
+
+
+def _maybe_get_a100_w2_config(
+    config: dict[str, int],
+    *,
+    w2: torch.Tensor,
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+) -> dict[str, int]:
+    if not (
+        envs.VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG
+        or envs.VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS
+    ):
+        return config
+    if not _is_a100_tuned_common_shape(
+        hidden_states=hidden_states,
+        num_tokens=num_tokens,
+        top_k_num=top_k_num,
+        quant_config=quant_config,
+        block_shape=block_shape,
+        lora_enabled=lora_enabled,
+    ):
+        return config
+    if (
+        w2.dim() != 3
+        or w2.shape[0] not in (64, 128)
+        or tuple(w2.shape[1:]) != (2048, 768)
+    ):
+        return config
+    return _a100_moe_tuned_config(config)
+
+
+def _use_a100_bf16_w1_kernel(
+    *,
+    w1: torch.Tensor,
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+    w1_bias: torch.Tensor | None,
+) -> bool:
+    if not envs.VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS:
+        return False
+    if w1_bias is not None:
+        return False
+    if not _is_a100_tuned_common_shape(
+        hidden_states=hidden_states,
+        num_tokens=num_tokens,
+        top_k_num=top_k_num,
+        quant_config=quant_config,
+        block_shape=block_shape,
+        lora_enabled=lora_enabled,
+    ):
+        return False
+    return (
+        w1.dim() == 3
+        and w1.shape[0] in (64, 128)
+        and tuple(w1.shape[1:]) == (1536, 2048)
+    )
+
+
+def _use_a100_bf16_w2_kernel(
+    *,
+    w2: torch.Tensor,
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+    w2_bias: torch.Tensor | None,
+    apply_router_weight_on_input: bool,
+    fuse_w2_reduce: bool,
+) -> bool:
+    if not envs.VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS:
+        return False
+    if w2_bias is not None or apply_router_weight_on_input or fuse_w2_reduce:
+        return False
+    if not _is_a100_tuned_common_shape(
+        hidden_states=hidden_states,
+        num_tokens=num_tokens,
+        top_k_num=top_k_num,
+        quant_config=quant_config,
+        block_shape=block_shape,
+        lora_enabled=lora_enabled,
+    ):
+        return False
+    return (
+        w2.dim() == 3
+        and w2.shape[0] in (64, 128)
+        and tuple(w2.shape[1:]) == (2048, 768)
+    )
+
+
+def _use_a100_bf16_w2_token_major_reduce_kernel(
+    *,
+    w2: torch.Tensor,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+    w2_bias: torch.Tensor | None,
+    apply_router_weight_on_input: bool,
+    fuse_w2_reduce: bool,
+) -> bool:
+    if not envs.VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE:
+        return False
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(80):
+        return False
+    if hidden_states.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        return False
+    if lora_enabled or block_shape is not None:
+        return False
+    if w2_bias is not None or apply_router_weight_on_input or fuse_w2_reduce:
+        return False
+    if top_k_num != 8:
+        return False
+    if num_tokens > envs.VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE_MAX_TOKENS:
+        return False
+    if not topk_weights.is_contiguous() or not topk_ids.is_contiguous():
+        return False
+    if (
+        quant_config.use_fp8_w8a8
+        or quant_config.use_int8_w8a8
+        or quant_config.use_int8_w8a16
+        or quant_config.use_int4_w4a16
+    ):
+        return False
+    return w2.dim() == 3 and w2.shape[0] == 128 and tuple(w2.shape[1:]) == (
+        2048,
+        768,
+    )
+
+
+def _use_ep_ignore_invalid_experts(
+    *,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_tokens: int,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+    expert_map: torch.Tensor | None,
+    apply_router_weight_on_input: bool,
+    fuse_w2_reduce: bool,
+) -> bool:
+    if not envs.VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS:
+        return False
+    if expert_map is None:
+        return False
+    if lora_enabled or block_shape is not None:
+        return False
+    if apply_router_weight_on_input or fuse_w2_reduce:
+        return False
+    if top_k_num != 8 or num_tokens < 1024:
+        return False
+    if hidden_states.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        return False
+    if not topk_weights.is_contiguous() or not topk_ids.is_contiguous():
+        return False
+    return not (
+        quant_config.use_fp8_w8a8
+        or quant_config.use_int8_w8a8
+        or quant_config.use_int8_w8a16
+        or quant_config.use_int4_w4a16
+    )
+
+
+def _use_ep_masked_activation(
+    *,
+    ep_ignore_invalid_experts: bool,
+    activation: MoEActivation,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    gemm1_clamp_limit: float | None,
+    top_k_num: int,
+) -> bool:
+    if not envs.VLLM_MOE_TRITON_EP_MASKED_ACTIVATION:
+        return False
+    if not ep_ignore_invalid_experts or expert_map is None:
+        return False
+    if activation != MoEActivation.SILU or gemm1_clamp_limit is not None:
+        return False
+    if top_k_num != 8:
+        return False
+    if input.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        return False
+    if input.ndim != 2 or output.ndim != 2:
+        return False
+    if input.size(1) != output.size(1) * 2:
+        return False
+    return input.is_contiguous() and output.is_contiguous() and topk_ids.is_contiguous()
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -230,6 +525,21 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             workspace13, (num_tokens * top_k_num, cache2_dim)
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+        lora_context = self._lora_context
+        ep_ignore_invalid_experts = _use_ep_ignore_invalid_experts(
+            hidden_states=hidden_states,
+            output=output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=self.quant_config,
+            block_shape=self.block_shape,
+            lora_enabled=lora_context is not None,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            fuse_w2_reduce=envs.VLLM_MOE_TRITON_W2_REDUCE_FUSION,
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             _prepare_expert_assignment(
@@ -242,6 +552,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 use_int8_w8a16=self.quant_config.use_int8_w8a16,
                 use_int4_w4a16=self.quant_config.use_int4_w4a16,
                 block_shape=self.block_shape,
+                ignore_invalid_experts=ep_ignore_invalid_experts,
             )
         )
 
@@ -255,9 +566,61 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         expert_ids_lora = None
         num_tokens_post_padded_lora = None
         token_lora_mapping = None
-        lora_context = self._lora_context
+        w1_config = _maybe_get_a100_w1_config(
+            config,
+            w1=w1,
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=self.quant_config,
+            block_shape=self.block_shape,
+            lora_enabled=lora_context is not None,
+        )
+        if w1_config is config:
+            w1_sorted_token_ids = sorted_token_ids
+            w1_expert_ids = expert_ids
+            w1_num_tokens_post_padded = num_tokens_post_padded
+        else:
+            w1_sorted_token_ids, w1_expert_ids, w1_num_tokens_post_padded = (
+                _prepare_expert_assignment(
+                    topk_ids,
+                    w1_config,
+                    num_tokens,
+                    top_k_num,
+                    global_num_experts,
+                    expert_map,
+                    use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                    use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                    block_shape=self.block_shape,
+                    ignore_invalid_experts=ep_ignore_invalid_experts,
+                )
+            )
+        use_a100_bf16_w1_kernel = _use_a100_bf16_w1_kernel(
+            w1=w1,
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=self.quant_config,
+            block_shape=self.block_shape,
+            lora_enabled=lora_context is not None,
+            w1_bias=self.w1_bias,
+        )
 
         def _base_w13_fn():
+            if use_a100_bf16_w1_kernel:
+                invoke_a100_bf16_moe_kernel(
+                    hidden_states,
+                    w1,
+                    intermediate_cache1,
+                    None,  # topk_weights
+                    w1_sorted_token_ids,
+                    w1_expert_ids,
+                    w1_num_tokens_post_padded,
+                    False,  # mul_routed_weight
+                    top_k_num,
+                    w1_config,
+                )
+                return
             invoke_fused_moe_triton_kernel(
                 hidden_states,
                 w1,
@@ -265,12 +628,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 a1q_scale if a1q_scale is not None else self.a1_scale,
                 self.w1_scale,
                 None,  # topk_weights
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
+                w1_sorted_token_ids,
+                w1_expert_ids,
+                w1_num_tokens_post_padded,
                 False,  # mul_routed_weights
                 top_k_num,
-                config,
+                w1_config,
                 compute_type=compute_type,
                 use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
                 use_int8_w8a8=self.quant_config.use_int8_w8a8,
@@ -357,9 +720,27 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quant_dtype=current_platform.fp8_dtype(),
             )
         else:
-            self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
+            activation_input = intermediate_cache1.view(-1, N)
+            if _use_ep_masked_activation(
+                ep_ignore_invalid_experts=ep_ignore_invalid_experts,
+                activation=activation,
+                input=activation_input,
+                output=intermediate_cache2,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+                gemm1_clamp_limit=self.quant_config.gemm1_clamp_limit,
+                top_k_num=top_k_num,
+            ):
+                assert expert_map is not None
+                moe_ep_masked_silu_and_mul(
+                    intermediate_cache2,
+                    activation_input,
+                    topk_ids,
+                    expert_map,
+                    top_k_num,
+                )
+            else:
+                self.activation(activation, intermediate_cache2, activation_input)
 
             qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
                 intermediate_cache2,
@@ -375,20 +756,140 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # sorted_token_ids_lora computed above. Same dual-stream pattern as
         # the w13 pair: base GEMM on default stream, LoRA delta on aux,
         # join via .add_() into intermediate_cache3.
+        fuse_w2_reduce = (
+            envs.VLLM_MOE_TRITON_W2_REDUCE_FUSION
+            and not ep_ignore_invalid_experts
+            and lora_context is None
+            and not apply_router_weight_on_input
+            and top_k_num == 8
+            and num_tokens >= envs.VLLM_MOE_TRITON_W2_REDUCE_FUSION_MIN_TOKENS
+            and output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and output.is_cuda
+            and output.is_contiguous()
+            and topk_weights.is_contiguous()
+            and sorted_token_ids is not None
+            and self.w2_bias is None
+            and not self.quant_config.use_fp8_w8a8
+            and not self.quant_config.use_int8_w8a8
+            and not self.quant_config.use_int8_w8a16
+            and not self.quant_config.use_int4_w4a16
+        )
+        w2_reduce_output = output
+        if fuse_w2_reduce:
+            if output.dtype != torch.float32:
+                w2_reduce_output = _resize_cache(
+                    workspace2.flatten().view(dtype=torch.float32),
+                    (num_tokens, K),
+                )
+            w2_reduce_output.zero_()
+
+        w2_config = _maybe_get_a100_w2_config(
+            config,
+            w2=w2,
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=self.quant_config,
+            block_shape=self.block_shape,
+            lora_enabled=lora_context is not None,
+        )
+        if w2_config is config:
+            w2_sorted_token_ids = sorted_token_ids
+            w2_expert_ids = expert_ids
+            w2_num_tokens_post_padded = num_tokens_post_padded
+        elif w2_config == w1_config:
+            w2_sorted_token_ids = w1_sorted_token_ids
+            w2_expert_ids = w1_expert_ids
+            w2_num_tokens_post_padded = w1_num_tokens_post_padded
+        else:
+            w2_sorted_token_ids, w2_expert_ids, w2_num_tokens_post_padded = (
+                _prepare_expert_assignment(
+                    topk_ids,
+                    w2_config,
+                    num_tokens,
+                    top_k_num,
+                    global_num_experts,
+                    expert_map,
+                    use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                    use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                    block_shape=self.block_shape,
+                    ignore_invalid_experts=ep_ignore_invalid_experts,
+                )
+            )
+        use_a100_bf16_w2_kernel = _use_a100_bf16_w2_kernel(
+            w2=w2,
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=self.quant_config,
+            block_shape=self.block_shape,
+            lora_enabled=lora_context is not None,
+            w2_bias=self.w2_bias,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            fuse_w2_reduce=fuse_w2_reduce,
+        )
+        use_a100_bf16_w2_token_major_reduce_kernel = (
+            _use_a100_bf16_w2_token_major_reduce_kernel(
+                w2=w2,
+                hidden_states=hidden_states,
+                output=output,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                num_tokens=num_tokens,
+                top_k_num=top_k_num,
+                quant_config=self.quant_config,
+                block_shape=self.block_shape,
+                lora_enabled=lora_context is not None,
+                w2_bias=self.w2_bias,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                fuse_w2_reduce=fuse_w2_reduce,
+            )
+        )
+        w2_mul_routed_weight = (
+            not apply_router_weight_on_input and not ep_ignore_invalid_experts
+        )
+
         def _base_w2_fn():
+            if (
+                use_a100_bf16_w2_token_major_reduce_kernel
+                and qintermediate_cache2.dtype == torch.bfloat16
+            ):
+                invoke_a100_bf16_w2_token_major_reduce_kernel(
+                    qintermediate_cache2,
+                    w2,
+                    output,
+                    topk_weights,
+                    topk_ids,
+                    expert_map,
+                )
+                return
+            if use_a100_bf16_w2_kernel and qintermediate_cache2.dtype == torch.bfloat16:
+                invoke_a100_bf16_moe_kernel(
+                    qintermediate_cache2,
+                    w2,
+                    intermediate_cache3,
+                    topk_weights,
+                    w2_sorted_token_ids,
+                    w2_expert_ids,
+                    w2_num_tokens_post_padded,
+                    w2_mul_routed_weight,
+                    1,
+                    w2_config,
+                )
+                return
             invoke_fused_moe_triton_kernel(
                 qintermediate_cache2,
                 w2,
-                intermediate_cache3,
+                w2_reduce_output if fuse_w2_reduce else intermediate_cache3,
                 a2q_scale,
                 self.w2_scale,
                 topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                not apply_router_weight_on_input,
+                w2_sorted_token_ids,
+                w2_expert_ids,
+                w2_num_tokens_post_padded,
+                w2_mul_routed_weight,
                 1,
-                config,
+                w2_config,
                 compute_type=compute_type,
                 use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
                 use_int8_w8a8=self.quant_config.use_int8_w8a8,
@@ -397,6 +898,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 per_channel_quant=self.per_act_token_quant,
                 block_shape=self.block_shape,
                 B_bias=self.w2_bias,
+                fused_topk_reduce=fuse_w2_reduce,
+                fused_topk_reduce_top_k=top_k_num,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -430,6 +933,21 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             intermediate_cache3.add_(lora_delta_w2)
         else:
             _base_w2_fn()
+            if use_a100_bf16_w2_token_major_reduce_kernel:
+                return
+            if fuse_w2_reduce:
+                if w2_reduce_output is not output:
+                    output.copy_(w2_reduce_output)
+                return
+            if ep_ignore_invalid_experts:
+                moe_fused_mul_sum(
+                    intermediate_cache3,
+                    topk_weights,
+                    output,
+                    topk_ids,
+                    expert_map,
+                )
+                return
             if lora_context is not None:
                 self.apply_w2_lora(
                     lora_context,
@@ -450,6 +968,21 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         self.moe_sum(intermediate_cache3, output)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        if envs.VLLM_MOE_TRITON_TOPK8_SUM:
+            min_triton_sum_tokens = max(
+                envs.VLLM_MOE_TRITON_TOPK8_SUM_MIN_TOKENS,
+                1024,
+            )
+            if (
+                input.ndim == 3
+                and input.size(1) == 8
+                and input.size(0) >= min_triton_sum_tokens
+                and input.is_cuda
+                and input.is_contiguous()
+                and output.is_contiguous()
+            ):
+                moe_sum_triton_topk8(input, output)
+                return
         ops.moe_sum(input, output)
 
 

@@ -7,6 +7,8 @@ Environment:
 - Backend: `allgather_reducescatter`
 - Benchmark: `benchmarks/kernels/sweep_moe_ep_a40.py --preset a40_quick --world-sizes 1,2 --warmup 3 --iters 10`
 - Raw data: `benchmarks/results/a40_quick_moe_ep.csv`
+- Repro metadata: `benchmarks/results/a40_quick_moe_ep.topology.txt`
+  and `benchmarks/results/a40_quick_moe_ep.meta.json`
 
 ## Main Finding
 
@@ -88,7 +90,10 @@ Compare these fields against A40:
 - `dispatch_us`
 - `combine_us`
 - `comm_ms`
+- `comm_share`
 - `speedup_vs_world1`
+- `expert_tokens_cv`
+- `expert_tokens_zero`
 
 If A100 SXM reduces `comm_ms` substantially and 2GPU speedup becomes positive,
 then the next useful work is overlap or fused communication/expert execution.

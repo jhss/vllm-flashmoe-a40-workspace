@@ -336,7 +336,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return output.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
-        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -358,9 +362,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+        if out is None:
+            output = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
+        else:
+            if dim != 0:
+                raise NotImplementedError("reduce_scatterv(out=...) requires dim=0")
+            if out.shape != output_shape:
+                raise ValueError(f"{out.shape} != {output_shape}")
+            if out.dtype != input_tensor.dtype:
+                raise ValueError(f"{out.dtype} != {input_tensor.dtype}")
+            if out.device != input_tensor.device:
+                raise ValueError(f"{out.device} != {input_tensor.device}")
+            output = out
 
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
             pynccl_comm.reduce_scatterv(output, input_tensor, sizes=sizes)
@@ -368,6 +383,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
+        if dim == 0:
+            return output
         return output.movedim(0, dim).contiguous()
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
@@ -519,17 +536,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def combine(
-        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Combine the hidden states and router logits from the appropriate device.
         This is a no-op in the base class.
         """
         assert self.all2all_manager is not None
-        return self.all2all_manager.combine(
-            hidden_states,
-            is_sequence_parallel,
-        )
+        if out is None:
+            return self.all2all_manager.combine(hidden_states, is_sequence_parallel)
+        return self.all2all_manager.combine(hidden_states, is_sequence_parallel, out)
 
     def batch_isend_irecv(self, p2p_ops: list):
         pynccl_comm = self.pynccl_comm

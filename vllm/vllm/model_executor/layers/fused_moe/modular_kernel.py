@@ -350,6 +350,15 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         """
         raise NotImplementedError
 
+    def expert_assignment_params(
+        self,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_map: torch.Tensor | None,
+        device: torch.device,
+    ) -> tuple[int, torch.Tensor | None]:
+        return global_num_experts, expert_map
+
     @abstractmethod
     def finalize(
         self,
@@ -1222,6 +1231,15 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
+        assignment_num_experts, assignment_expert_map = (
+            self.prepare_finalize.expert_assignment_params(
+                global_num_experts,
+                local_num_experts,
+                expert_map,
+                a1q.device,
+            )
+        )
+
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
             a1q.device,
@@ -1230,7 +1248,7 @@ class FusedMoEKernelModularImpl:
             N,
             K,
             top_k,
-            global_num_experts,
+            assignment_num_experts,
             local_num_experts,
             expert_tokens_meta,
             activation,
@@ -1261,8 +1279,8 @@ class FusedMoEKernelModularImpl:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
+            global_num_experts=assignment_num_experts,
+            expert_map=assignment_expert_map,
             a1q_scale=a1q_scale,
             a2_scale=self.fused_experts.a2_scale,
             workspace13=workspace13,
