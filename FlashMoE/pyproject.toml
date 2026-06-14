@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashmoe-py"
+version = "0.1.2"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+description = "Completely Fused Distributed MoE"
+requires-python = ">=3.10"
+authors = [
+  { name = "Osayamen Jonathan Aimuyo", email = "osayamen@stanford.edu" },
+]
+
+dependencies = [
+    "cuda-core>=0.5.0"
+]
+
+[project.optional-dependencies]
+cu12 = ["nvshmem4py-cu12"]
+cu13 = ["nvshmem4py-cu13"]
+
+[project.urls]
+Homepage = "https://github.com/osayamenja/FlashMoE"
+Repository = "https://github.com/osayamenja/FlashMoE"
+
+[tool.setuptools]
+packages = ["flashmoe"]
+
+[tool.setuptools.package-data]
+flashmoe = [
+    "CMakeLists.txt",
+    "cmake/*"
+]

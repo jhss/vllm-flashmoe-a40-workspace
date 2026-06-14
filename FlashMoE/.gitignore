@@ -1,0 +1,20 @@
+.idea/
+*.iml
+.DS_Store
+__pycache__/
+*.lock
+*egg-info/
+.venv/
+
+# csrc
+csrc/cmake-build-*
+csrc/.idea
+csrc/*.iml
+csrc/cmake/cache
+csrc/include/flashmoe/*.txt
+csrc/include/flashmoe/*.log
+csrc/*.txt
+csrc/*.log
+
+build/
+dist/
