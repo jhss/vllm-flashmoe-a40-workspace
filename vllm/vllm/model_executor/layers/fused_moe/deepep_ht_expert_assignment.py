@@ -7,6 +7,12 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _assert_async(condition: torch.Tensor) -> None:
+    assert_async = getattr(torch, "_assert_async", None)
+    if assert_async is not None:
+        assert_async(condition)
+
+
 @triton.jit
 def _fill_expert_ids_kernel(
     expert_counts,
@@ -15,7 +21,6 @@ def _fill_expert_ids_kernel(
     num_schedule_experts: tl.constexpr,
     num_local_experts: tl.constexpr,
     block_size_m: tl.constexpr,
-    max_blocks_per_expert: tl.constexpr,
     blocks_per_program: tl.constexpr,
 ):
     expert_idx = tl.program_id(0)
@@ -28,21 +33,19 @@ def _fill_expert_ids_kernel(
     num_blocks = (count + block_size_m - 1) // block_size_m
     start = tl.load(expert_offsets + expert_idx) // block_size_m
     expert_id = tl.where(expert_idx < num_local_experts, expert_idx, -1)
-    mask = (
-        (expert_idx < num_schedule_experts)
-        & (block_offsets < num_blocks)
-        & (block_offsets < max_blocks_per_expert)
-    )
+    mask = (expert_idx < num_schedule_experts) & (block_offsets < num_blocks)
     tl.store(expert_ids + start + block_offsets, expert_id, mask=mask)
 
 
 @triton.jit
 def _scatter_token_ids_kernel(
     topk_ids,
+    expert_counts,
     expert_offsets,
     expert_write_offsets,
     sorted_token_ids,
-    num_pairs: tl.constexpr,
+    overflow_flag,
+    num_pairs,
     num_local_experts: tl.constexpr,
     include_invalid: tl.constexpr,
     block_size: tl.constexpr,
@@ -60,10 +63,24 @@ def _scatter_token_ids_kernel(
     expert_pos = tl.atomic_add(
         expert_write_offsets + schedule_expert, 1, sem="relaxed", mask=should_write
     )
+    expert_count = tl.load(expert_counts + schedule_expert, mask=should_write, other=0)
+    store_mask = should_write & (expert_pos < expert_count)
+    overflow = should_write & (expert_pos >= expert_count)
+    tl.store(overflow_flag, 1, mask=tl.any(overflow))
     output_offsets = tl.load(
         expert_offsets + schedule_expert, mask=should_write, other=0
     ) + expert_pos
-    tl.store(sorted_token_ids + output_offsets, offsets, mask=should_write)
+    tl.store(sorted_token_ids + output_offsets, offsets, mask=store_mask)
+
+
+def deepep_ht_remap_to_local_sentinel(
+    topk_ids: torch.Tensor, num_local_experts: int
+) -> torch.Tensor:
+    """Convert raw DeepEP invalid IDs to the local sentinel for generic align."""
+    invalid_sentinel = torch.full(
+        (), num_local_experts, dtype=topk_ids.dtype, device=topk_ids.device
+    )
+    return torch.where(topk_ids == -1, invalid_sentinel, topk_ids)
 
 
 def _make_expert_counts(
@@ -80,8 +97,9 @@ def _make_expert_counts(
     if not include_invalid:
         return counts
 
-    invalid_count = topk_ids.numel() - counts.sum()
-    invalid_count = torch.clamp(invalid_count, min=0).view(1)
+    raw_invalid_count = topk_ids.numel() - counts.sum()
+    _assert_async(raw_invalid_count >= 0)
+    invalid_count = torch.clamp(raw_invalid_count, min=0).view(1)
     return torch.cat((counts, invalid_count))
 
 
@@ -101,8 +119,18 @@ def deepep_ht_prepare_expert_assignment(
     assert expert_num_tokens.is_cuda, (
         "DeepEP HT direct assignment requires CUDA expert_num_tokens"
     )
+    assert topk_ids.device == expert_num_tokens.device, (
+        "topk_ids and expert_num_tokens must be on the same device"
+    )
+    assert topk_ids.dtype in (torch.int32, torch.int64), (
+        "topk_ids must be int32 or int64"
+    )
+    assert expert_num_tokens.dtype in (torch.int32, torch.int64), (
+        "expert_num_tokens must be int32 or int64"
+    )
     assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
     assert block_size_m > 0, "block_size_m must be positive"
+    assert expert_num_tokens.dim() == 1, "expert_num_tokens must be 1D"
     assert expert_num_tokens.numel() > 0, "expert_num_tokens must be non-empty"
 
     if topk_ids.numel() == 0:
@@ -158,6 +186,7 @@ def deepep_ht_prepare_expert_assignment(
         device=topk_ids.device,
     )
     expert_write_offsets = torch.zeros_like(expert_counts)
+    overflow_flag = torch.zeros((1,), dtype=torch.int32, device=topk_ids.device)
 
     blocks_per_program = 64
     max_blocks_per_expert = triton.cdiv(topk_ids.numel(), block_size_m)
@@ -173,20 +202,22 @@ def deepep_ht_prepare_expert_assignment(
             num_schedule_experts,
             num_local_experts,
             block_size_m,
-            max_blocks_per_expert,
             blocks_per_program,
         )
 
     block_size = 256
     _scatter_token_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
         topk_ids,
+        expert_counts,
         expert_offsets,
         expert_write_offsets,
         sorted_token_ids,
+        overflow_flag,
         topk_ids.numel(),
         num_local_experts,
         include_invalid,
         block_size,
     )
+    _assert_async(torch.all(overflow_flag == 0))
 
     return sorted_token_ids, expert_ids, num_tokens_post_padded

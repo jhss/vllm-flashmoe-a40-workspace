@@ -283,18 +283,21 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x, expert_x_scale = token_data, None
 
         assert expert_topk_ids is not None
+        use_direct_assignment = envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
         use_local_expert_ids = (
-            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
-            or envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or use_direct_assignment
         )
-        if use_local_expert_ids:
+        # When direct assignment is enabled, preserve DeepEP HT's raw local IDs.
+        # The direct assignment path handles -1 invalid entries directly;
+        # generic fallback remaps them immediately before alignment.
+        if not use_direct_assignment and use_local_expert_ids:
             local_num_experts = len(expert_num_tokens_per_expert_list)
             expert_topk_ids = remap_deepep_ht_topk_ids(
                 expert_topk_ids,
                 local_num_experts,
                 0,
             )
-        else:
+        elif not use_direct_assignment:
             # The existing MOE kernels assume that all entries of topk_ids are
             # valid. To that effect, set the -1s in expert_topk_ids to some
             # expert outside this rank so the expert_map can remap it to -1.

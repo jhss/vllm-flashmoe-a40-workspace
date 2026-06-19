@@ -7,6 +7,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.deepep_ht_expert_assignment import (
     deepep_ht_prepare_expert_assignment,
+    deepep_ht_remap_to_local_sentinel,
 )
 
 
@@ -72,6 +73,23 @@ def _assert_assignment_matches_topk(
         atol=0,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_deepep_ht_remap_to_local_sentinel(dtype: torch.dtype):
+    topk_ids = torch.tensor(
+        [[-1, 0, 3], [4, -1, 2]],
+        dtype=dtype,
+    )
+
+    remapped = deepep_ht_remap_to_local_sentinel(topk_ids, num_local_experts=4)
+
+    expected = torch.tensor(
+        [[4, 0, 3], [4, 4, 2]],
+        dtype=dtype,
+    )
+    torch.testing.assert_close(remapped, expected, atol=0, rtol=0)
+    assert remapped.dtype == dtype
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

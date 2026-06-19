@@ -7,6 +7,11 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm import envs
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.a100_moe_kernels import (
+    invoke_a100_bf16_moe_kernel,
+    invoke_a100_bf16_w2_token_major_reduce_kernel,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -15,10 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.deepep_ht_expert_assignment import (
     deepep_ht_prepare_expert_assignment,
-)
-from vllm.model_executor.layers.fused_moe.a100_moe_kernels import (
-    invoke_a100_bf16_moe_kernel,
-    invoke_a100_bf16_w2_token_major_reduce_kernel,
+    deepep_ht_remap_to_local_sentinel,
 )
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
@@ -64,6 +66,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+logger = init_logger(__name__)
 
 
 def _a100_moe_tuned_config(config: dict[str, int]) -> dict[str, int]:
@@ -420,6 +424,13 @@ def _prepare_triton_expert_assignment(
         lora_enabled=lora_enabled,
     ):
         assert expert_tokens_meta is not None
+        logger.info_once(
+            "Using DeepEP HT direct expert assignment: topk=%d, "
+            "local_experts=%d, block_m=%d",
+            top_k_num,
+            expert_tokens_meta.expert_num_tokens.numel(),
+            block_size_m,
+        )
         return deepep_ht_prepare_expert_assignment(
             topk_ids,
             expert_tokens_meta.expert_num_tokens,
@@ -427,8 +438,19 @@ def _prepare_triton_expert_assignment(
             ignore_invalid_experts=ignore_invalid_experts,
         )
 
+    generic_topk_ids = topk_ids
+    if (
+        envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+        and expert_tokens_meta is not None
+        and expert_tokens_meta.assignment_layout
+        == mk.ExpertAssignmentLayout.DeepEPHTLocal
+    ):
+        generic_topk_ids = deepep_ht_remap_to_local_sentinel(
+            topk_ids, expert_tokens_meta.expert_num_tokens.numel()
+        )
+
     return _prepare_expert_assignment(
-        topk_ids,
+        generic_topk_ids,
         config,
         num_tokens,
         top_k_num,
