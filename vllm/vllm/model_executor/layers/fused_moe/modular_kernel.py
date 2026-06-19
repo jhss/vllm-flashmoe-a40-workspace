@@ -101,9 +101,13 @@ class ExpertAssignmentLayout(Enum):
     """
     Standard vLLM/global expert-id layout.
     """
-    DeepEPHTLocal = ("deepep_ht_local",)
+    DeepEPHTLocalSentinel = ("deepep_ht_local_sentinel",)
     """
     DeepEP HT receiver-local expert ids plus a local invalid sentinel.
+    """
+    DeepEPHTLocalRaw = ("deepep_ht_local_raw",)
+    """
+    DeepEP HT receiver-local expert ids plus raw -1 invalid entries.
     """
 
 
@@ -783,6 +787,13 @@ class FusedMoEExperts(ABC):
         """
         A flag indicating whether or not this class can process packed ue8m0
         activation scales.
+        """
+        return False
+
+    def supports_deepep_ht_raw_local_ids(self) -> bool:
+        """
+        Whether this experts implementation can consume DeepEP HT top-k ids
+        with raw local expert ids and -1 invalid entries.
         """
         return False
 

@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HT_TRITON_TOPK_REMAP: bool = False
     VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS: bool = False
     VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT: bool = False
+    VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG: bool = False
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
@@ -1786,6 +1787,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Triton expert assignment schedule from receiver-local top-k ids.
     "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT", "0"))
+    ),
+    # Enable extra validation for the DeepEP HT direct assignment scheduler.
+    "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG", "0"))
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput

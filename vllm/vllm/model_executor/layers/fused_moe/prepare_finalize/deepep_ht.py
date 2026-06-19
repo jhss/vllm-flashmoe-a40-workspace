@@ -106,6 +106,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
         self._local_expert_maps: dict[tuple[torch.device, int], torch.Tensor] = {}
+        self._preserve_raw_local_ids = False
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -114,6 +115,31 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
+        if not envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT:
+            return
+        if not fused_experts.supports_deepep_ht_raw_local_ids():
+            raise ValueError(
+                "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT requires an experts "
+                "backend that supports DeepEP HT raw local top-k ids."
+            )
+        if fused_experts.moe_config.is_lora_enabled:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT does not support LoRA."
+            )
+        quant_config = fused_experts.quant_config
+        if (
+            quant_config.use_fp8_w8a8
+            or quant_config.use_int8_w8a8
+            or quant_config.use_int8_w8a16
+            or quant_config.use_int4_w4a16
+        ):
+            raise ValueError(
+                "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT does not support "
+                "quantized expert kernels."
+            )
+        self._preserve_raw_local_ids = True
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -156,7 +182,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> tuple[int, torch.Tensor | None]:
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
-            or envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+            or self._preserve_raw_local_ids
         )
         if not use_local_expert_ids:
             return global_num_experts, expert_map
@@ -283,7 +309,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x, expert_x_scale = token_data, None
 
         assert expert_topk_ids is not None
-        use_direct_assignment = envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+        use_direct_assignment = self._preserve_raw_local_ids
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or use_direct_assignment
         )
@@ -319,9 +345,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
         # on GPU.
         assignment_layout = (
-            mk.ExpertAssignmentLayout.DeepEPHTLocal
-            if use_local_expert_ids
-            else mk.ExpertAssignmentLayout.Generic
+            mk.ExpertAssignmentLayout.DeepEPHTLocalRaw
+            if use_direct_assignment
+            else (
+                mk.ExpertAssignmentLayout.DeepEPHTLocalSentinel
+                if use_local_expert_ids
+                else mk.ExpertAssignmentLayout.Generic
+            )
         )
         expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
             expert_num_tokens_per_expert_list,

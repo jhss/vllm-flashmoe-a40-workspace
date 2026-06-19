@@ -369,7 +369,7 @@ def _use_deepep_ht_direct_assignment(
         return False
     if (
         expert_tokens_meta.assignment_layout
-        != mk.ExpertAssignmentLayout.DeepEPHTLocal
+        != mk.ExpertAssignmentLayout.DeepEPHTLocalRaw
     ):
         return False
     if expert_tokens_meta.expert_num_tokens is None:
@@ -443,7 +443,7 @@ def _prepare_triton_expert_assignment(
         envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
         and expert_tokens_meta is not None
         and expert_tokens_meta.assignment_layout
-        == mk.ExpertAssignmentLayout.DeepEPHTLocal
+        == mk.ExpertAssignmentLayout.DeepEPHTLocalRaw
     ):
         generic_topk_ids = deepep_ht_remap_to_local_sentinel(
             topk_ids, expert_tokens_meta.expert_num_tokens.numel()
@@ -535,6 +535,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_batch_invariance():
+        return True
+
+    def supports_deepep_ht_raw_local_ids(self) -> bool:
         return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:

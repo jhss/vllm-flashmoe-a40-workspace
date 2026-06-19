@@ -6,8 +6,12 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.deepep_ht_expert_assignment import (
+    _make_expert_counts,
     deepep_ht_prepare_expert_assignment,
     deepep_ht_remap_to_local_sentinel,
+)
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+    moe_fused_mul_sum,
 )
 
 
@@ -90,6 +94,53 @@ def test_deepep_ht_remap_to_local_sentinel(dtype: torch.dtype):
     )
     torch.testing.assert_close(remapped, expected, atol=0, rtol=0)
     assert remapped.dtype == dtype
+
+
+def test_make_expert_counts_keeps_int32_with_invalid():
+    topk_ids = torch.tensor([[-1, 0, 1], [2, 4, -1]], dtype=torch.int64)
+    expert_num_tokens = torch.tensor([1, 1, 1, 0], dtype=torch.int64)
+
+    expert_counts = _make_expert_counts(
+        topk_ids, expert_num_tokens, include_invalid=True
+    )
+
+    torch.testing.assert_close(
+        expert_counts,
+        torch.tensor([1, 1, 1, 0, 3], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    assert expert_counts.dtype == torch.int32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_fused_mul_sum_masks_raw_negative_topk_ids():
+    inputs = torch.arange(2 * 3 * 4, device="cuda", dtype=torch.float32).view(2, 3, 4)
+    topk_weights = torch.tensor(
+        [[0.5, 1.0, 1.5], [2.0, 0.25, 0.75]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor(
+        [[-1, 0, 2], [3, -1, 5]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    expert_map = torch.tensor([0, -1, 1, 2], device="cuda", dtype=torch.int32)
+    output = torch.empty((2, 4), device="cuda", dtype=torch.float32)
+
+    actual = moe_fused_mul_sum(inputs, topk_weights, output, topk_ids, expert_map)
+
+    expected = torch.zeros_like(output)
+    for m in range(topk_ids.size(0)):
+        for k in range(topk_ids.size(1)):
+            expert_id = int(topk_ids[m, k].item())
+            if (
+                0 <= expert_id < expert_map.numel()
+                and int(expert_map[expert_id].item()) >= 0
+            ):
+                expected[m] += inputs[m, k] * topk_weights[m, k]
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

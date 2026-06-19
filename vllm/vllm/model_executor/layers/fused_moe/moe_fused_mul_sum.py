@@ -17,6 +17,7 @@ def moe_fused_mul_sum_kernel(
     num_tokens,
     stride_m,
     has_expert_map: tl.constexpr,
+    expert_map_size,
     top_k: tl.constexpr,
     size: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -40,8 +41,14 @@ def moe_fused_mul_sum_kernel(
     for n in tl.static_range(top_k):
         b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
         if has_expert_map:
-            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
-            expert_mask = tl.load(expert_map_ptr + id_val) >= 0
+            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=-1)
+            id_in_range = m_mask & (id_val >= 0) & (id_val < expert_map_size)
+            local_expert = tl.load(
+                expert_map_ptr + id_val,
+                mask=id_in_range,
+                other=-1,
+            )
+            expert_mask = local_expert >= 0
             a_vec = tl.load(
                 a_base + n * size,
                 mask=mask & expert_mask[:, None],
@@ -233,6 +240,12 @@ def moe_fused_mul_sum(
 
     assert outputs.shape == output_shape
     assert topk_weights.shape == (num_tokens, top_k)
+    if expert_map is not None:
+        assert topk_ids is not None
+        assert topk_ids.shape == (num_tokens, top_k)
+        assert topk_ids.is_contiguous()
+        assert expert_map.is_contiguous()
+    expert_map_size = expert_map.numel() if expert_map is not None else 0
 
     if not isinstance(inputs, FakeTensor):
         BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(
@@ -251,6 +264,7 @@ def moe_fused_mul_sum(
             num_tokens,
             top_k * size,
             expert_map is not None,
+            expert_map_size,
             top_k,
             size,
             BLOCK_M,
