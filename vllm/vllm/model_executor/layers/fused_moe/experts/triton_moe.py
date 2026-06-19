@@ -13,6 +13,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.deepep_ht_expert_assignment import (
+    deepep_ht_prepare_expert_assignment,
+)
 from vllm.model_executor.layers.fused_moe.a100_moe_kernels import (
     invoke_a100_bf16_moe_kernel,
     invoke_a100_bf16_w2_token_major_reduce_kernel,
@@ -346,6 +349,98 @@ def _use_ep_masked_activation(
     return input.is_contiguous() and output.is_contiguous() and topk_ids.is_contiguous()
 
 
+def _use_deepep_ht_direct_assignment(
+    topk_ids: torch.Tensor,
+    expert_tokens_meta: mk.ExpertTokensMetadata | None,
+    *,
+    hidden_states: torch.Tensor,
+    top_k_num: int,
+    quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
+    lora_enabled: bool,
+) -> bool:
+    if not envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT:
+        return False
+    if expert_tokens_meta is None:
+        return False
+    if (
+        expert_tokens_meta.assignment_layout
+        != mk.ExpertAssignmentLayout.DeepEPHTLocal
+    ):
+        return False
+    if expert_tokens_meta.expert_num_tokens is None:
+        return False
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    if top_k_num != 8:
+        return False
+    if lora_enabled or block_shape is not None:
+        return False
+    if expert_tokens_meta.expert_num_tokens.numel() != 64:
+        return False
+    if (
+        quant_config.use_fp8_w8a8
+        or quant_config.use_int8_w8a8
+        or quant_config.use_int8_w8a16
+        or quant_config.use_int4_w4a16
+    ):
+        return False
+    return (
+        topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and expert_tokens_meta.expert_num_tokens.is_cuda
+    )
+
+
+def _prepare_triton_expert_assignment(
+    topk_ids: torch.Tensor,
+    config: dict[str, int],
+    num_tokens: int,
+    top_k_num: int,
+    global_num_experts: int,
+    expert_map: torch.Tensor | None,
+    expert_tokens_meta: mk.ExpertTokensMetadata | None,
+    *,
+    hidden_states: torch.Tensor,
+    quant_config: FusedMoEQuantConfig,
+    lora_enabled: bool,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    block_shape: list[int] | None = None,
+    ignore_invalid_experts: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    block_size_m = int(config["BLOCK_SIZE_M"])
+    if _use_deepep_ht_direct_assignment(
+        topk_ids,
+        expert_tokens_meta,
+        hidden_states=hidden_states,
+        top_k_num=top_k_num,
+        quant_config=quant_config,
+        block_shape=block_shape,
+        lora_enabled=lora_enabled,
+    ):
+        assert expert_tokens_meta is not None
+        return deepep_ht_prepare_expert_assignment(
+            topk_ids,
+            expert_tokens_meta.expert_num_tokens,
+            block_size_m,
+            ignore_invalid_experts=ignore_invalid_experts,
+        )
+
+    return _prepare_expert_assignment(
+        topk_ids,
+        config,
+        num_tokens,
+        top_k_num,
+        global_num_experts,
+        expert_map,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        block_shape=block_shape,
+        ignore_invalid_experts=ignore_invalid_experts,
+    )
+
+
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
@@ -541,19 +636,37 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             fuse_w2_reduce=envs.VLLM_MOE_TRITON_W2_REDUCE_FUSION,
         )
 
+        assignment_cache: dict[
+            int, tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]
+        ] = {}
+
+        def _get_expert_assignment(
+            assignment_config: dict[str, int],
+        ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+            block_size_m = int(assignment_config["BLOCK_SIZE_M"])
+            cached_assignment = assignment_cache.get(block_size_m)
+            if cached_assignment is None:
+                cached_assignment = _prepare_triton_expert_assignment(
+                    topk_ids,
+                    assignment_config,
+                    num_tokens,
+                    top_k_num,
+                    global_num_experts,
+                    expert_map,
+                    expert_tokens_meta,
+                    hidden_states=hidden_states,
+                    quant_config=self.quant_config,
+                    lora_enabled=lora_context is not None,
+                    use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                    use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                    block_shape=self.block_shape,
+                    ignore_invalid_experts=ep_ignore_invalid_experts,
+                )
+                assignment_cache[block_size_m] = cached_assignment
+            return cached_assignment
+
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            _prepare_expert_assignment(
-                topk_ids,
-                config,
-                num_tokens,
-                top_k_num,
-                global_num_experts,
-                expert_map,
-                use_int8_w8a16=self.quant_config.use_int8_w8a16,
-                use_int4_w4a16=self.quant_config.use_int4_w4a16,
-                block_shape=self.block_shape,
-                ignore_invalid_experts=ep_ignore_invalid_experts,
-            )
+            _get_expert_assignment(config)
         )
 
         # LoRA w13: applied to intermediate_cache1 before activation. When
@@ -576,25 +689,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
             lora_enabled=lora_context is not None,
         )
-        if w1_config is config:
-            w1_sorted_token_ids = sorted_token_ids
-            w1_expert_ids = expert_ids
-            w1_num_tokens_post_padded = num_tokens_post_padded
-        else:
-            w1_sorted_token_ids, w1_expert_ids, w1_num_tokens_post_padded = (
-                _prepare_expert_assignment(
-                    topk_ids,
-                    w1_config,
-                    num_tokens,
-                    top_k_num,
-                    global_num_experts,
-                    expert_map,
-                    use_int8_w8a16=self.quant_config.use_int8_w8a16,
-                    use_int4_w4a16=self.quant_config.use_int4_w4a16,
-                    block_shape=self.block_shape,
-                    ignore_invalid_experts=ep_ignore_invalid_experts,
-                )
-            )
+        w1_sorted_token_ids, w1_expert_ids, w1_num_tokens_post_padded = (
+            _get_expert_assignment(w1_config)
+        )
         use_a100_bf16_w1_kernel = _use_a100_bf16_w1_kernel(
             w1=w1,
             hidden_states=hidden_states,
@@ -793,29 +890,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
             lora_enabled=lora_context is not None,
         )
-        if w2_config is config:
-            w2_sorted_token_ids = sorted_token_ids
-            w2_expert_ids = expert_ids
-            w2_num_tokens_post_padded = num_tokens_post_padded
-        elif w2_config == w1_config:
-            w2_sorted_token_ids = w1_sorted_token_ids
-            w2_expert_ids = w1_expert_ids
-            w2_num_tokens_post_padded = w1_num_tokens_post_padded
-        else:
-            w2_sorted_token_ids, w2_expert_ids, w2_num_tokens_post_padded = (
-                _prepare_expert_assignment(
-                    topk_ids,
-                    w2_config,
-                    num_tokens,
-                    top_k_num,
-                    global_num_experts,
-                    expert_map,
-                    use_int8_w8a16=self.quant_config.use_int8_w8a16,
-                    use_int4_w4a16=self.quant_config.use_int4_w4a16,
-                    block_shape=self.block_shape,
-                    ignore_invalid_experts=ep_ignore_invalid_experts,
-                )
-            )
+        w2_sorted_token_ids, w2_expert_ids, w2_num_tokens_post_padded = (
+            _get_expert_assignment(w2_config)
+        )
         use_a100_bf16_w2_kernel = _use_a100_bf16_w2_kernel(
             w2=w2,
             hidden_states=hidden_states,

@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DeepEP HT local expert assignment helpers."""
+
+import torch
+
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _fill_expert_ids_kernel(
+    expert_counts,
+    expert_offsets,
+    expert_ids,
+    num_schedule_experts: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    block_size_m: tl.constexpr,
+    max_blocks_per_expert: tl.constexpr,
+    blocks_per_program: tl.constexpr,
+):
+    expert_idx = tl.program_id(0)
+    block_chunk = tl.program_id(1)
+    block_offsets = block_chunk * blocks_per_program + tl.arange(
+        0, blocks_per_program
+    )
+
+    count = tl.load(expert_counts + expert_idx)
+    num_blocks = (count + block_size_m - 1) // block_size_m
+    start = tl.load(expert_offsets + expert_idx) // block_size_m
+    expert_id = tl.where(expert_idx < num_local_experts, expert_idx, -1)
+    mask = (
+        (expert_idx < num_schedule_experts)
+        & (block_offsets < num_blocks)
+        & (block_offsets < max_blocks_per_expert)
+    )
+    tl.store(expert_ids + start + block_offsets, expert_id, mask=mask)
+
+
+@triton.jit
+def _scatter_token_ids_kernel(
+    topk_ids,
+    expert_offsets,
+    expert_write_offsets,
+    sorted_token_ids,
+    num_pairs: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    include_invalid: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < num_pairs
+    expert_ids = tl.load(topk_ids + offsets, mask=mask, other=-1)
+    is_valid = (expert_ids >= 0) & (expert_ids < num_local_experts)
+    schedule_expert = tl.where(is_valid, expert_ids, num_local_experts)
+    if include_invalid:
+        should_write = mask
+    else:
+        should_write = mask & is_valid
+
+    expert_pos = tl.atomic_add(
+        expert_write_offsets + schedule_expert, 1, sem="relaxed", mask=should_write
+    )
+    output_offsets = tl.load(
+        expert_offsets + schedule_expert, mask=should_write, other=0
+    ) + expert_pos
+    tl.store(sorted_token_ids + output_offsets, offsets, mask=should_write)
+
+
+def _make_expert_counts(
+    topk_ids: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    include_invalid: bool,
+) -> torch.Tensor:
+    counts = expert_num_tokens
+    if counts.dtype != torch.int32:
+        counts = counts.to(torch.int32)
+    if not counts.is_contiguous():
+        counts = counts.contiguous()
+
+    if not include_invalid:
+        return counts
+
+    invalid_count = topk_ids.numel() - counts.sum()
+    invalid_count = torch.clamp(invalid_count, min=0).view(1)
+    return torch.cat((counts, invalid_count))
+
+
+def deepep_ht_prepare_expert_assignment(
+    topk_ids: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    block_size_m: int,
+    *,
+    ignore_invalid_experts: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a Triton MoE assignment schedule from DeepEP HT local metadata.
+
+    ``topk_ids`` must already be in DeepEP HT receiver-local expert-id space,
+    where invalid entries use the sentinel ``num_local_experts`` or ``-1``.
+    """
+    assert topk_ids.is_cuda, "DeepEP HT direct assignment requires CUDA topk_ids"
+    assert expert_num_tokens.is_cuda, (
+        "DeepEP HT direct assignment requires CUDA expert_num_tokens"
+    )
+    assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
+    assert block_size_m > 0, "block_size_m must be positive"
+    assert expert_num_tokens.numel() > 0, "expert_num_tokens must be non-empty"
+
+    if topk_ids.numel() == 0:
+        num_schedule_experts = expert_num_tokens.numel()
+        max_num_tokens_padded = num_schedule_experts * (block_size_m - 1)
+        max_num_blocks = triton.cdiv(max_num_tokens_padded, block_size_m)
+        return (
+            torch.full(
+                (max_num_tokens_padded,),
+                topk_ids.numel(),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            ),
+            torch.full(
+                (max_num_blocks,),
+                -1,
+                dtype=torch.int32,
+                device=topk_ids.device,
+            ),
+            torch.zeros((1,), dtype=torch.int32, device=topk_ids.device),
+        )
+
+    num_local_experts = expert_num_tokens.numel()
+    include_invalid = not ignore_invalid_experts
+    expert_counts = _make_expert_counts(
+        topk_ids, expert_num_tokens, include_invalid=include_invalid
+    )
+    num_schedule_experts = expert_counts.numel()
+
+    padded_counts = torch.div(
+        expert_counts + block_size_m - 1, block_size_m, rounding_mode="floor"
+    ) * block_size_m
+    expert_offsets = torch.empty_like(padded_counts)
+    expert_offsets[0] = 0
+    if num_schedule_experts > 1:
+        expert_offsets[1:] = torch.cumsum(padded_counts[:-1], dim=0)
+    num_tokens_post_padded = padded_counts.sum().view(1).to(torch.int32)
+
+    max_num_tokens_padded = topk_ids.numel() + num_schedule_experts * (
+        block_size_m - 1
+    )
+    max_num_blocks = triton.cdiv(max_num_tokens_padded, block_size_m)
+    sorted_token_ids = torch.full(
+        (max_num_tokens_padded,),
+        topk_ids.numel(),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    expert_ids = torch.full(
+        (max_num_blocks,),
+        -1,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    expert_write_offsets = torch.zeros_like(expert_counts)
+
+    blocks_per_program = 64
+    max_blocks_per_expert = triton.cdiv(topk_ids.numel(), block_size_m)
+    if max_blocks_per_expert > 0:
+        grid = (
+            num_schedule_experts,
+            triton.cdiv(max_blocks_per_expert, blocks_per_program),
+        )
+        _fill_expert_ids_kernel[grid](
+            expert_counts,
+            expert_offsets,
+            expert_ids,
+            num_schedule_experts,
+            num_local_experts,
+            block_size_m,
+            max_blocks_per_expert,
+            blocks_per_program,
+        )
+
+    block_size = 256
+    _scatter_token_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
+        topk_ids,
+        expert_offsets,
+        expert_write_offsets,
+        sorted_token_ids,
+        topk_ids.numel(),
+        num_local_experts,
+        include_invalid,
+        block_size,
+    )
+
+    return sorted_token_ids, expert_ids, num_tokens_post_padded

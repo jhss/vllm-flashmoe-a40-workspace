@@ -92,6 +92,21 @@ class FusedMoEActivationFormat(Enum):
     BatchedExperts = ("batched_experts",)
 
 
+class ExpertAssignmentLayout(Enum):
+    """
+    The expert-id layout used by prepared top-k ids.
+    """
+
+    Generic = ("generic",)
+    """
+    Standard vLLM/global expert-id layout.
+    """
+    DeepEPHTLocal = ("deepep_ht_local",)
+    """
+    DeepEP HT receiver-local expert ids plus a local invalid sentinel.
+    """
+
+
 @dataclass
 class ExpertTokensMetadata:
     """
@@ -100,10 +115,13 @@ class ExpertTokensMetadata:
 
     expert_num_tokens: torch.Tensor
     expert_num_tokens_cpu: torch.Tensor | None
+    assignment_layout: ExpertAssignmentLayout = ExpertAssignmentLayout.Generic
 
     @staticmethod
     def make_from_list(
-        expert_num_tokens_list: list[int], device: str
+        expert_num_tokens_list: list[int],
+        device: str | torch.device,
+        assignment_layout: ExpertAssignmentLayout = ExpertAssignmentLayout.Generic,
     ) -> "ExpertTokensMetadata":
         expert_num_tokens_cpu = torch.tensor(
             expert_num_tokens_list, device="cpu", dtype=torch.int32
@@ -111,6 +129,7 @@ class ExpertTokensMetadata:
         return ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens_cpu.to(device, non_blocking=True),
             expert_num_tokens_cpu=expert_num_tokens_cpu,
+            assignment_layout=assignment_layout,
         )
 
 

@@ -154,7 +154,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         expert_map: torch.Tensor | None,
         device: torch.device,
     ) -> tuple[int, torch.Tensor | None]:
-        if not envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
+        use_local_expert_ids = (
+            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
+            or envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+        )
+        if not use_local_expert_ids:
             return global_num_experts, expert_map
         return (
             local_num_experts + 1,
@@ -279,7 +283,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x, expert_x_scale = token_data, None
 
         assert expert_topk_ids is not None
-        if envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
+        use_local_expert_ids = (
+            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
+            or envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+        )
+        if use_local_expert_ids:
             local_num_experts = len(expert_num_tokens_per_expert_list)
             expert_topk_ids = remap_deepep_ht_topk_ids(
                 expert_topk_ids,
@@ -307,8 +315,15 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # Makes a GPU-CPU copy.
         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
         # on GPU.
+        assignment_layout = (
+            mk.ExpertAssignmentLayout.DeepEPHTLocal
+            if use_local_expert_ids
+            else mk.ExpertAssignmentLayout.Generic
+        )
         expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            expert_num_tokens_per_expert_list, device=expert_x.device
+            expert_num_tokens_per_expert_list,
+            device=expert_x.device,
+            assignment_layout=assignment_layout,
         )
 
         # * For non-block quant, dispatch in b16 and quantize now as
