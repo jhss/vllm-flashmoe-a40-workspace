@@ -1791,9 +1791,12 @@ direct assignment는 receiver prepare를 줄인다. top-k remap은 baseline
 1393.3 us까지 낮춰 손실을 줄이지만, 여전히 baseline보다 약 71 us 느리다.
 
 결론적으로 현재 direct assignment의 문제는 receiver remap 제거가 아니라
-raw local assignment layout 이후의 expert compute/scheduling 효율이다.
-다음 유효한 방향은 direct assignment 자체보다 DeepEP HT raw/local layout에 맞는
-전용 W1/W2 scheduler 또는 compact local-routed route space다.
+raw local assignment layout 이후의 expert compute/scheduling 효율처럼 보였다.
+하지만 이후 Section 15의 assignment/GEMM 분리 benchmark에서 experts 증가의
+원인은 W1/W2 GEMM 효율이 아니라 direct assignment builder의 고정 비용으로
+확인되었다. 따라서 이 해석은 "전용 W1/W2 scheduler 필요"가 아니라
+"DeepEP raw/local route-space를 빠른 generic align 경로에 연결"하는 방향으로
+수정한다.
 ```
 
 ## 15. DeepEP HT assignment builder와 prebuilt GEMM 분리 측정
@@ -1974,3 +1977,151 @@ direct assignment builder ~= local-ID generic align + 135~192 us
 `ignore-invalid`는 여전히 긍정적인 방향이다. builder 고정 비용이 제거되면 큰
 prefill에서는 local/direct route-space의 작은 schedule과 invalid block 제거가
 end-to-end win으로 이어질 가능성이 높다.
+
+## 16. DeepEP HT generic ignore-invalid missing 조건 측정
+
+Section 14의 end-to-end 표에는 다음 두 조건이 빠져 있었다.
+
+```text
+global generic + ignore-invalid
+local-ID generic + ignore-invalid
+```
+
+Section 15에서 `local-ID generic + ignore-invalid`가 direct+ignore와 같은
+schedule을 약 24 us에 만든다는 것을 확인했으므로, direct builder 최적화보다
+이 두 조건의 실제 2-GPU forward 성능을 먼저 측정했다.
+
+측정 전 환경 메모:
+
+```text
+uv run ruff 시도 후 CUDA 13 runtime wheel들이 venv에 섞여 PyNccl이
+"CUDA driver version is insufficient for CUDA runtime version"으로 실패했다.
+cu13 wheel을 제거하고 cu12 wheel을 재설치해 torch/NCCL/FlashInfer import를
+복구한 뒤 측정했다.
+
+torch=2.11.0+cu128
+CUDA driver=570.172.08
+nvidia-smi CUDA=12.8
+nvidia-nccl-cu12=2.28.9
+nvidia-cuda-runtime-cu12=12.9.79
+cuda-python=12.9.7
+cuda-bindings=12.9.7
+cuda-tile=1.4.0
+```
+
+측정 조건:
+
+```text
+commit=acef97424
+GPU=2x NVIDIA A100-SXM4-80GB, NV12
+backend=deepep_high_throughput
+world_size=2
+hidden=2048
+intermediate=768
+global experts=128
+local experts=64
+top_k=8
+dtype=BF16
+warmup=20
+iters=100
+independent runs=5
+VLLM_DEEPEP_HT_NUM_SMS=24
+VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=0
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG=0
+NCCL_P2P_DISABLE=0
+```
+
+조건별 추가 flag:
+
+```text
+global generic + ignore:
+  VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=0
+
+local-ID generic + ignore:
+  VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_ignore_missing_20260620_raw.csv
+benchmarks/results/deepep_ht_ignore_missing_20260620_commands.log
+```
+
+CSV/log는 `.gitignore` 대상이라 git에는 추가하지 않았다.
+
+새로 측정한 missing 조건의 critical-path median:
+
+| tokens | global generic + ignore | local-ID generic + ignore |
+|---:|---:|---:|
+| 128 | 1441.9 us | 1439.8 us |
+| 512 | 1711.8 us | 1701.8 us |
+| 1024 | 1941.6 us | 1930.1 us |
+| 2048 | 2605.3 us | 2615.7 us |
+
+min/max/IQR:
+
+| tokens | 설정 | median | min | max | IQR |
+|---:|---|---:|---:|---:|---:|
+| 128 | global + ignore | 1441.9 | 1425.0 | 1478.7 | 23.6 |
+| 128 | local-ID + ignore | 1439.8 | 1430.3 | 1456.2 | 13.2 |
+| 512 | global + ignore | 1711.8 | 1672.2 | 1714.2 | 11.3 |
+| 512 | local-ID + ignore | 1701.8 | 1633.8 | 1727.8 | 55.5 |
+| 1024 | global + ignore | 1941.6 | 1934.3 | 1983.0 | 28.1 |
+| 1024 | local-ID + ignore | 1930.1 | 1908.1 | 1978.8 | 23.1 |
+| 2048 | global + ignore | 2605.3 | 2496.8 | 2636.9 | 91.1 |
+| 2048 | local-ID + ignore | 2615.7 | 2445.4 | 2631.5 | 124.6 |
+
+Section 14의 baseline/direct+ignore medians와 나란히 보면 다음과 같다.
+baseline과 direct+ignore는 Section 14의 기존 5-run median이고, global/local
+ignore는 이번 새 측정이다.
+
+| tokens | baseline | global + ignore | local-ID + ignore | direct + ignore |
+|---:|---:|---:|---:|---:|
+| 128 | 1447.1 | 1441.9 | 1439.8 | 1638.7 |
+| 512 | 1722.7 | 1711.8 | 1701.8 | 1915.2 |
+| 1024 | 2054.5 | 1941.6 | 1930.1 | 2102.2 |
+| 2048 | 2717.7 | 2605.3 | 2615.7 | 2739.9 |
+
+baseline 대비:
+
+| tokens | global + ignore | local-ID + ignore | direct + ignore |
+|---:|---:|---:|---:|
+| 128 | -5.2 us (-0.4%) | -7.3 us (-0.5%) | +191.6 us (+13.2%) |
+| 512 | -10.9 us (-0.6%) | -20.9 us (-1.2%) | +192.5 us (+11.2%) |
+| 1024 | -112.9 us (-5.5%) | -124.4 us (-6.1%) | +47.7 us (+2.3%) |
+| 2048 | -112.4 us (-4.1%) | -102.0 us (-3.8%) | +22.2 us (+0.8%) |
+
+해석:
+
+```text
+1. direct+ignore가 느린 이유는 direct schedule 품질이 아니라 direct builder
+   고정 비용이라는 Section 15 결론이 end-to-end에서도 확인됐다.
+
+2. global generic + ignore와 local-ID generic + ignore는 모두 direct+ignore보다
+   훨씬 빠르다.
+
+3. 1024/2048에서는 ignore-invalid generic 경로가 기존 baseline보다 4~6%
+   빠르다. 작은 token에서는 baseline과 거의 같은 수준이다.
+
+4. local-ID generic + ignore는 128/512/1024에서 global+ignore보다 약간 빠르고,
+   2048에서는 noise 범위에서 global+ignore가 약간 빠르다. 둘의 차이는
+   direct builder penalty와 비교하면 작다.
+```
+
+따라서 다음 우선순위는 direct Triton builder 확장이 아니다. 현재 가장 좋은
+실용 경로는 다음이다.
+
+```text
+DeepEP HT + generic moe_align_block_size + ignore-invalid
+```
+
+그중 receiver remap까지 줄이려면 다음 단계가 맞다.
+
+```text
+1. 기존 CUDA moe_align_block_size에 raw local -1 skip mode 추가
+2. DeepEP HT receiver에서 -1 -> local sentinel remap을 생략
+3. raw local IDs를 generic align custom op가 직접 histogram/align
+4. 1024-token 부근부터 runtime threshold로 활성화 여부 검증
+```
