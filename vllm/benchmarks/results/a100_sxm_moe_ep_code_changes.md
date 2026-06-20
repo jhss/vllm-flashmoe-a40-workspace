@@ -2125,3 +2125,168 @@ DeepEP HT + generic moe_align_block_size + ignore-invalid
 3. raw local IDs를 generic align custom op가 직접 histogram/align
 4. 1024-token 부근부터 runtime threshold로 활성화 여부 검증
 ```
+
+## 17. DeepEP HT generic ignore-invalid same-session paired 재측정
+
+Section 16은 missing 조건을 채우는 데 충분했지만, baseline/direct+ignore와
+측정 세션이 달랐다. 이번에는 같은 세션에서 baseline, global-ignore,
+local-ID-ignore를 cycle별로 섞어 재측정했다.
+
+추가로 벤치마크 스크립트에 다음 필드를 기록했다.
+
+```text
+input_tokens
+received_tokens_rank0/rank1
+ep_ignore_enabled_rank0/rank1
+valid_route_pairs_rank0/rank1
+invalid_route_pairs_rank0/rank1
+assignment_stats_rank0/rank1
+```
+
+`assignment_stats` 형식은 다음과 같다.
+
+```text
+block_m:num_tokens_post_padded/valid_blocks/invalid_blocks
+```
+
+측정 조건:
+
+```text
+base_commit=b439cdf47
+GPU=2x NVIDIA A100-SXM4-80GB, driver=570.172.08, 81920 MiB each
+torch=2.11.0+cu128
+CUDA=12.8
+backend=deepep_high_throughput
+world_size=2
+hidden=2048
+intermediate=768
+global experts=128
+local experts=64
+top_k=8
+dtype=BF16
+warmup=20
+iters=100
+cycles=10
+VLLM_DEEPEP_HT_NUM_SMS=24
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=0
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG=0
+NCCL_P2P_DISABLE=0
+```
+
+cycle 순서:
+
+```text
+cycle 1: baseline -> global-ignore -> local-ID-ignore
+cycle 2: local-ID-ignore -> global-ignore -> baseline
+cycle 3: global-ignore -> baseline -> local-ID-ignore
+위 순서를 10 cycles까지 반복
+```
+
+설정별 flag:
+
+```text
+baseline:
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=0
+  VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=0
+
+global-ignore:
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1
+  VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=0
+
+local-ID-ignore:
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1
+  VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_paired_ignore_20260620_raw.csv
+benchmarks/results/deepep_ht_paired_ignore_20260620_commands.log
+```
+
+CSV/log는 `.gitignore` 대상이라 git에는 추가하지 않았다. CSV는 header 포함
+121줄, 즉 10 cycles x 4 token sizes x 3 settings = 120 rows이며 누락은 없다.
+
+critical path 절대값:
+
+| tokens | baseline median us (IQR/min/max) | global-ignore median us (IQR/min/max) | local-ID-ignore median us (IQR/min/max) |
+|---:|---:|---:|---:|
+| 128 | 1451.0 (18.8/1423.1/1482.8) | 1447.9 (7.9/1434.5/1520.3) | 1458.0 (28.1/1427.6/2076.2) |
+| 512 | 1728.4 (16.3/1712.1/1756.4) | 1711.1 (20.5/1690.3/1734.4) | 1711.1 (31.2/1690.4/1758.8) |
+| 1024 | 2042.1 (31.6/2003.7/2075.6) | 1957.8 (16.5/1909.1/2001.5) | 1954.6 (25.6/1927.2/1980.6) |
+| 2048 | 2765.7 (45.8/2638.1/2789.3) | 2618.2 (26.5/2503.5/2784.5) | 2610.6 (69.5/2469.2/2777.7) |
+
+같은 `(cycle, tokens)` 안에서 baseline을 뺀 paired 차이:
+
+| tokens | global-ignore - baseline | local-ID-ignore - baseline | local-ID - global |
+|---:|---:|---:|---:|
+| 128 | -0.6 us (-0.04%, IQR 27.7, min/max -48.3/+68.2) | +5.0 us (+0.34%, IQR 54.0, min/max -26.2/+626.4) | +5.4 us (IQR 27.9, min/max -16.0/+629.9) |
+| 512 | -20.8 us (-1.20%, IQR 23.1, min/max -47.7/-0.5) | -21.1 us (-1.22%, IQR 29.8, min/max -39.1/+8.8) | +3.5 us (IQR 18.9, min/max -26.8/+46.4) |
+| 1024 | -80.9 us (-3.96%, IQR 27.6, min/max -101.4/-50.6) | -77.6 us (-3.80%, IQR 35.0, min/max -123.4/-40.4) | -0.6 us (IQR 32.4, min/max -49.3/+50.7) |
+| 2048 | -137.2 us (-4.96%, IQR 55.6, min/max -266.9/-4.8) | -142.6 us (-5.16%, IQR 28.9, min/max -278.7/-11.6) | -9.0 us (IQR 42.1, min/max -85.5/+127.6) |
+
+ignore-invalid 실제 활성 여부:
+
+| tokens | setting | rank0 true/total | rank1 true/total |
+|---:|---|---:|---:|
+| 128 | baseline | 0/10 | 0/10 |
+| 128 | global-ignore | 0/10 | 0/10 |
+| 128 | local-ID-ignore | 0/10 | 0/10 |
+| 512 | baseline | 0/10 | 0/10 |
+| 512 | global-ignore | 0/10 | 10/10 |
+| 512 | local-ID-ignore | 0/10 | 10/10 |
+| 1024 | baseline | 0/10 | 0/10 |
+| 1024 | global-ignore | 10/10 | 10/10 |
+| 1024 | local-ID-ignore | 10/10 | 10/10 |
+| 2048 | baseline | 0/10 | 0/10 |
+| 2048 | global-ignore | 10/10 | 10/10 |
+| 2048 | local-ID-ignore | 10/10 | 10/10 |
+
+rank별 received tokens와 route pair 통계 median:
+
+| input tokens | received tokens r0/r1 | valid route pairs r0/r1 | invalid route pairs r0/r1 |
+|---:|---:|---:|---:|
+| 128 | 256/256 | 1032/1016 | 1016/1032 |
+| 512 | 1016/1024 | 4032/4160 | 4096/4032 |
+| 1024 | 2044/2044 | 8236/8148 | 8116/8204 |
+| 2048 | 4078/4080 | 16310/16458 | 16314/16182 |
+
+대표 assignment stats:
+
+| tokens | baseline r0/r1 | ignore r0/r1 |
+|---:|---|---|
+| 128 | `64:5120/64/16` / `64:5184/64/17` | `64:5120/64/16` / `64:5184/64/17` |
+| 512 | `128:12288/64/32` / `128:12288/64/32` | `128:12288/64/32` / `128:8192/64/0` |
+| 1024 | `128:20736/98/64` / `128:19968/91/65` | `128:12544/98/0` / `128:11648/91/0` |
+| 2048 | `128:36352/156/128` / `128:36864/161/127` | `128:19968/156/0` / `128:20608/161/0` |
+
+해석:
+
+```text
+1. 128 tokens에서는 ignore env를 켜도 runtime threshold 때문에 실제 ignore
+   경로가 켜지지 않는다. 성능 차이도 noise다.
+
+2. 512 tokens에서는 rank1만 ignore가 켜진다. paired로 약 -21 us, -1.2%가
+   보이지만 partial activation 조건이므로 큰 결론은 내리지 않는다.
+
+3. 1024/2048 tokens에서는 양 rank 모두 ignore가 켜진다. paired 기준
+   global-ignore는 -3.96%/-4.96%, local-ID-ignore는 -3.80%/-5.16%로
+   baseline보다 안정적으로 빠르다.
+
+4. global-ignore와 local-ID-ignore의 차이는 작고 방향이 일정하지 않다.
+   local-ID가 더 빠르다고 결론낼 근거는 없다. 이번 결과에서 유의미한
+   효과는 route-space가 아니라 invalid block을 schedule에서 제거하는
+   ignore-invalid 경로다.
+```
+
+따라서 Section 16의 결론은 다음처럼 보강한다.
+
+```text
+현재 최선의 실용 경로:
+DeepEP HT + generic moe_align_block_size + ignore-invalid
+
+추가 direct Triton builder 개발은 우선순위가 낮다.
+다음 최적화 후보는 generic CUDA align에 raw -1 skip mode를 넣어
+receiver의 -1 -> local sentinel remap 비용을 줄이는 것이다.
+```

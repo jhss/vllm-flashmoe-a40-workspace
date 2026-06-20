@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 from torch.multiprocessing import spawn
@@ -77,6 +77,17 @@ class BenchResult:
     rank0_forward_us: float
     rank1_forward_us: float | None
     critical_path_us: float
+    input_tokens: int
+    received_tokens_rank0: int | None
+    received_tokens_rank1: int | None
+    ep_ignore_enabled_rank0: bool | None
+    ep_ignore_enabled_rank1: bool | None
+    valid_route_pairs_rank0: int | None
+    valid_route_pairs_rank1: int | None
+    invalid_route_pairs_rank0: int | None
+    invalid_route_pairs_rank1: int | None
+    assignment_stats_rank0: str | None
+    assignment_stats_rank1: str | None
     topk_us: float | None
     dispatch_us: float | None
     combine_us: float | None
@@ -339,6 +350,192 @@ class SectionProfiler:
 
 
 _SECTION_PROFILER: SectionProfiler | None = None
+_COLLECT_EP_STATS = False
+_EP_STATS: dict[str, Any] = {}
+
+
+def reset_ep_stats() -> None:
+    global _EP_STATS
+    _EP_STATS = {
+        "receiver": {},
+        "ignore": {},
+        "assignments": [],
+    }
+
+
+def _stat_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _stat_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def format_assignment_stats(assignments: list[dict[str, int]]) -> str | None:
+    if not assignments:
+        return None
+    seen: dict[int, dict[str, int]] = {}
+    for item in assignments:
+        seen[int(item["block_m"])] = item
+    parts = []
+    for block_m in sorted(seen):
+        item = seen[block_m]
+        parts.append(
+            f"{block_m}:"
+            f"{item['num_tokens_post_padded']}/"
+            f"{item['valid_blocks']}/"
+            f"{item['invalid_blocks']}"
+        )
+    return ";".join(parts)
+
+
+def summarize_ep_stats() -> dict[str, Any]:
+    receiver = _EP_STATS.get("receiver", {})
+    ignore = _EP_STATS.get("ignore", {})
+    return {
+        "received_tokens": _stat_int(receiver.get("received_tokens")),
+        "valid_route_pairs": _stat_int(receiver.get("valid_route_pairs")),
+        "invalid_route_pairs": _stat_int(receiver.get("invalid_route_pairs")),
+        "ep_ignore_enabled": _stat_bool(ignore.get("enabled")),
+        "assignment_stats": format_assignment_stats(
+            _EP_STATS.get("assignments", [])
+        ),
+    }
+
+
+def gather_ep_stats(local_stats: dict[str, Any], world_size: int) -> list[dict]:
+    if world_size == 1:
+        return [local_stats]
+    gathered: list[dict[str, Any] | None] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, local_stats)
+    return [item or {} for item in gathered]
+
+
+def _rank_stat(
+    gathered_stats: list[dict[str, Any]],
+    rank: int,
+    name: str,
+) -> Any:
+    if rank >= len(gathered_stats):
+        return None
+    return gathered_stats[rank].get(name)
+
+
+def install_ep_stats_collectors() -> None:
+    from vllm.model_executor.layers.fused_moe.experts import triton_moe
+
+    try:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize import deepep_ht
+    except ImportError:
+        deepep_ht = None
+
+    if deepep_ht is not None:
+        _wrap_deepep_ht_receiver_stats(deepep_ht.DeepEPHTPrepareAndFinalize)
+    _wrap_ep_ignore_stats(triton_moe)
+    _wrap_assignment_stats(triton_moe)
+
+
+def _wrap_deepep_ht_receiver_stats(cls: type) -> None:
+    original_attr = "_moe_ep_stats_original__receiver"
+    if hasattr(cls, original_attr):
+        return
+
+    original = getattr(cls, "_receiver")
+
+    def wrapped(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if not _COLLECT_EP_STATS:
+            return result
+
+        expert_x, _, expert_tokens_meta, expert_topk_ids, _ = result
+        valid_route_pairs = None
+        invalid_route_pairs = None
+        if expert_tokens_meta is not None:
+            counts = getattr(expert_tokens_meta, "expert_num_tokens", None)
+            if counts is not None:
+                valid_route_pairs = int(counts.sum(dtype=torch.int32).item())
+        if expert_topk_ids is not None and valid_route_pairs is not None:
+            invalid_route_pairs = int(expert_topk_ids.numel()) - valid_route_pairs
+        _EP_STATS["receiver"] = {
+            "received_tokens": int(expert_x.shape[0]),
+            "valid_route_pairs": valid_route_pairs,
+            "invalid_route_pairs": invalid_route_pairs,
+        }
+        return result
+
+    setattr(cls, original_attr, original)
+    setattr(cls, "_receiver", wrapped)
+
+
+def _wrap_ep_ignore_stats(triton_moe_module) -> None:
+    original_attr = "_moe_ep_stats_original__use_ep_ignore_invalid_experts"
+    if hasattr(triton_moe_module, original_attr):
+        return
+
+    original = triton_moe_module._use_ep_ignore_invalid_experts
+
+    def wrapped(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if _COLLECT_EP_STATS:
+            _EP_STATS["ignore"] = {
+                "enabled": bool(result),
+                "num_tokens": int(kwargs.get("num_tokens", -1)),
+            }
+        return result
+
+    setattr(triton_moe_module, original_attr, original)
+    setattr(triton_moe_module, "_use_ep_ignore_invalid_experts", wrapped)
+
+
+def _wrap_assignment_stats(triton_moe_module) -> None:
+    original_attr = "_moe_ep_stats_original__prepare_triton_expert_assignment"
+    if hasattr(triton_moe_module, original_attr):
+        return
+
+    original = triton_moe_module._prepare_triton_expert_assignment
+
+    def wrapped(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if _COLLECT_EP_STATS:
+            config = args[1]
+            block_m = int(config["BLOCK_SIZE_M"])
+            _, expert_ids, num_tokens_post_padded = result
+            post_padded = int(num_tokens_post_padded.item())
+            used_blocks = (post_padded + block_m - 1) // block_m
+            used_expert_ids = expert_ids[:used_blocks]
+            valid_blocks = int((used_expert_ids >= 0).sum().item())
+            _EP_STATS["assignments"].append(
+                {
+                    "block_m": block_m,
+                    "num_tokens_post_padded": post_padded,
+                    "valid_blocks": valid_blocks,
+                    "invalid_blocks": used_blocks - valid_blocks,
+                }
+            )
+        return result
+
+    setattr(triton_moe_module, original_attr, original)
+    setattr(triton_moe_module, "_prepare_triton_expert_assignment", wrapped)
+
+
+def collect_ep_stats(
+    args: argparse.Namespace,
+    forward_once: Callable[[], object],
+) -> list[dict]:
+    global _COLLECT_EP_STATS
+    install_ep_stats_collectors()
+    reset_ep_stats()
+    _COLLECT_EP_STATS = True
+    try:
+        forward_once()
+        torch.accelerator.synchronize()
+    finally:
+        _COLLECT_EP_STATS = False
+    return gather_ep_stats(summarize_ep_stats(), args.world_size)
 
 
 def _wrap_profiled_method(cls: type, method_name: str, section_name: str) -> None:
@@ -732,6 +929,7 @@ def run_worker(
         ]
         torch.distributed.all_gather(rank_latencies_tensor, local_latency)
         rank_forward_us = [latency.item() for latency in rank_latencies_tensor]
+        ep_stats_by_rank = collect_ep_stats(args, forward_once)
         run_section_profile(args, rank, forward_once)
         run_torch_kernel_profile(args, rank, forward_once)
 
@@ -809,6 +1007,37 @@ def run_worker(
             rank0_forward_us=rank_forward_us[0],
             rank1_forward_us=rank_forward_us[1] if args.world_size > 1 else None,
             critical_path_us=max(rank_forward_us),
+            input_tokens=args.tokens,
+            received_tokens_rank0=_rank_stat(
+                ep_stats_by_rank, 0, "received_tokens"
+            ),
+            received_tokens_rank1=_rank_stat(
+                ep_stats_by_rank, 1, "received_tokens"
+            ),
+            ep_ignore_enabled_rank0=_rank_stat(
+                ep_stats_by_rank, 0, "ep_ignore_enabled"
+            ),
+            ep_ignore_enabled_rank1=_rank_stat(
+                ep_stats_by_rank, 1, "ep_ignore_enabled"
+            ),
+            valid_route_pairs_rank0=_rank_stat(
+                ep_stats_by_rank, 0, "valid_route_pairs"
+            ),
+            valid_route_pairs_rank1=_rank_stat(
+                ep_stats_by_rank, 1, "valid_route_pairs"
+            ),
+            invalid_route_pairs_rank0=_rank_stat(
+                ep_stats_by_rank, 0, "invalid_route_pairs"
+            ),
+            invalid_route_pairs_rank1=_rank_stat(
+                ep_stats_by_rank, 1, "invalid_route_pairs"
+            ),
+            assignment_stats_rank0=_rank_stat(
+                ep_stats_by_rank, 0, "assignment_stats"
+            ),
+            assignment_stats_rank1=_rank_stat(
+                ep_stats_by_rank, 1, "assignment_stats"
+            ),
             topk_us=topk_us,
             dispatch_us=dispatch_us,
             combine_us=combine_us,
