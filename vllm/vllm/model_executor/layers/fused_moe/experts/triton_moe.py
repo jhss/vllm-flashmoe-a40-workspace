@@ -311,7 +311,8 @@ def _use_ep_ignore_invalid_experts(
         return False
     if apply_router_weight_on_input or fuse_w2_reduce:
         return False
-    if top_k_num != 8 or num_tokens < 1024:
+    min_tokens = envs.VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS
+    if top_k_num != 8 or num_tokens < min_tokens:
         return False
     if hidden_states.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
         return False

@@ -77,11 +77,18 @@ class BenchResult:
     rank0_forward_us: float
     rank1_forward_us: float | None
     critical_path_us: float
+    rank_distinct_inputs: bool
+    weight_seed: int
+    input_seed_base: int | None
+    input_seed_rank0: int | None
+    input_seed_rank1: int | None
     input_tokens: int
     received_tokens_rank0: int | None
     received_tokens_rank1: int | None
     ep_ignore_enabled_rank0: bool | None
     ep_ignore_enabled_rank1: bool | None
+    ep_ignore_num_tokens_rank0: int | None
+    ep_ignore_num_tokens_rank1: int | None
     valid_route_pairs_rank0: int | None
     valid_route_pairs_rank1: int | None
     invalid_route_pairs_rank0: int | None
@@ -110,6 +117,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--rank-distinct-inputs",
+        action="store_true",
+        help=(
+            "Use the same seed for weights on every rank, but generate "
+            "hidden states and router logits with rank-specific seeds."
+        ),
+    )
+    parser.add_argument(
+        "--input-seed-base",
+        type=int,
+        help=(
+            "Seed for hidden states and router logits. With "
+            "--rank-distinct-inputs, each rank uses input_seed_base + rank."
+        ),
+    )
     parser.add_argument("--csv", action="store_true")
     parser.add_argument(
         "--section-profile-iters",
@@ -205,6 +228,15 @@ def expert_ids_for_rank(layer: torch.nn.Module, num_experts: int) -> torch.Tenso
     return torch.nonzero(expert_map >= 0, as_tuple=False).flatten().to("cuda")
 
 
+def input_seed_for_rank(args: argparse.Namespace, rank: int) -> int | None:
+    if args.input_seed_base is None and not args.rank_distinct_inputs:
+        return None
+    base = args.input_seed_base
+    if base is None:
+        base = args.seed + 1000
+    return base + rank if args.rank_distinct_inputs else base
+
+
 def make_layer_and_inputs(
     args: argparse.Namespace,
     rank: int,
@@ -252,6 +284,10 @@ def make_layer_and_inputs(
     layer.routed_experts.quant_method.process_weights_after_loading(
         layer.routed_experts
     )
+
+    input_seed = input_seed_for_rank(args, rank)
+    if input_seed is not None:
+        set_random_seed(input_seed)
 
     hidden_states = (
         torch.randn(args.tokens, args.hidden_size, device=device, dtype=dtype) / 10
@@ -401,6 +437,7 @@ def summarize_ep_stats() -> dict[str, Any]:
         "valid_route_pairs": _stat_int(receiver.get("valid_route_pairs")),
         "invalid_route_pairs": _stat_int(receiver.get("invalid_route_pairs")),
         "ep_ignore_enabled": _stat_bool(ignore.get("enabled")),
+        "ep_ignore_num_tokens": _stat_int(ignore.get("num_tokens")),
         "assignment_stats": format_assignment_stats(
             _EP_STATS.get("assignments", [])
         ),
@@ -1007,6 +1044,13 @@ def run_worker(
             rank0_forward_us=rank_forward_us[0],
             rank1_forward_us=rank_forward_us[1] if args.world_size > 1 else None,
             critical_path_us=max(rank_forward_us),
+            rank_distinct_inputs=args.rank_distinct_inputs,
+            weight_seed=args.seed,
+            input_seed_base=args.input_seed_base,
+            input_seed_rank0=input_seed_for_rank(args, 0),
+            input_seed_rank1=(
+                input_seed_for_rank(args, 1) if args.world_size > 1 else None
+            ),
             input_tokens=args.tokens,
             received_tokens_rank0=_rank_stat(
                 ep_stats_by_rank, 0, "received_tokens"
@@ -1019,6 +1063,12 @@ def run_worker(
             ),
             ep_ignore_enabled_rank1=_rank_stat(
                 ep_stats_by_rank, 1, "ep_ignore_enabled"
+            ),
+            ep_ignore_num_tokens_rank0=_rank_stat(
+                ep_stats_by_rank, 0, "ep_ignore_num_tokens"
+            ),
+            ep_ignore_num_tokens_rank1=_rank_stat(
+                ep_stats_by_rank, 1, "ep_ignore_num_tokens"
             ),
             valid_route_pairs_rank0=_rank_stat(
                 ep_stats_by_rank, 0, "valid_route_pairs"

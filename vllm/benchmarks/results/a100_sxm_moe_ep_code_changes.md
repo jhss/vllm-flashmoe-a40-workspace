@@ -2203,10 +2203,21 @@ local-ID-ignore:
 ```text
 benchmarks/results/deepep_ht_paired_ignore_20260620_raw.csv
 benchmarks/results/deepep_ht_paired_ignore_20260620_commands.log
+benchmarks/results/analyze_deepep_ht_paired.py
 ```
 
-CSV/log는 `.gitignore` 대상이라 git에는 추가하지 않았다. CSV는 header 포함
-121줄, 즉 10 cycles x 4 token sizes x 3 settings = 120 rows이며 누락은 없다.
+CSV/log는 원래 `.gitignore` 대상이지만, paired difference 재계산을 위해
+`git add -f`로 커밋했다. 분석 스크립트는 raw CSV에서 아래 표를 재생성한다.
+CSV는 header 포함 121줄, 즉 10 cycles x 4 token sizes x 3 settings =
+120 rows이며 누락은 없다.
+
+```text
+vllm/.venv/bin/python \
+  vllm/benchmarks/results/analyze_deepep_ht_paired.py
+```
+
+아래 latency 값은 각 run 안에서 `iters=100` 전체 CUDA event 시간을 100으로
+나눈 steady-state 평균이고, 표의 median은 이 run-level 평균 10개의 median이다.
 
 critical path 절대값:
 
@@ -2242,6 +2253,23 @@ ignore-invalid 실제 활성 여부:
 | 2048 | baseline | 0/10 | 0/10 |
 | 2048 | global-ignore | 10/10 | 10/10 |
 | 2048 | local-ID-ignore | 10/10 | 10/10 |
+
+critical rank와 rank별 latency median:
+
+| tokens | setting | critical rank r0/r1/tie | rank0 median us | rank1 median us | recv r0/r1 median |
+|---:|---|---:|---:|---:|---:|
+| 128 | baseline | 5/5/0 | 1451.0 | 1450.5 | 256/256 |
+| 128 | global-ignore | 5/5/0 | 1447.9 | 1447.6 | 256/256 |
+| 128 | local-ID-ignore | 2/8/0 | 1458.0 | 1457.5 | 256/256 |
+| 512 | baseline | 6/4/0 | 1727.8 | 1728.4 | 1016/1024 |
+| 512 | global-ignore | 5/5/0 | 1710.8 | 1710.9 | 1016/1024 |
+| 512 | local-ID-ignore | 6/4/0 | 1711.1 | 1710.7 | 1016/1024 |
+| 1024 | baseline | 6/4/0 | 2042.1 | 2041.5 | 2044/2044 |
+| 1024 | global-ignore | 6/4/0 | 1957.3 | 1957.8 | 2044/2044 |
+| 1024 | local-ID-ignore | 5/5/0 | 1954.3 | 1954.2 | 2044/2044 |
+| 2048 | baseline | 4/6/0 | 2765.2 | 2765.7 | 4078/4080 |
+| 2048 | global-ignore | 6/4/0 | 2618.0 | 2618.0 | 4078/4080 |
+| 2048 | local-ID-ignore | 5/5/0 | 2610.6 | 2610.2 | 4078/4080 |
 
 rank별 received tokens와 route pair 통계 median:
 
@@ -2289,4 +2317,207 @@ DeepEP HT + generic moe_align_block_size + ignore-invalid
 추가 direct Triton builder 개발은 우선순위가 낮다.
 다음 최적화 후보는 generic CUDA align에 raw -1 skip mode를 넣어
 receiver의 -1 -> local sentinel remap 비용을 줄이는 것이다.
+```
+
+## 18. Rank-distinct input seed와 512-token threshold sweep
+
+Section 17의 paired 재측정은 같은 rank input/routing을 반복한 workload였다.
+이번에는 weight seed는 고정하고 rank별 hidden/router seed를 다르게 주는
+benchmark 옵션을 추가했다.
+
+추가된 benchmark 옵션과 필드:
+
+```text
+--rank-distinct-inputs
+--input-seed-base
+rank_distinct_inputs
+weight_seed
+input_seed_base
+input_seed_rank0/rank1
+ep_ignore_num_tokens_rank0/rank1
+```
+
+또한 512-token cliff를 직접 sweep하기 위해 다음 env를 추가했다. 기본값은
+기존 동작과 같은 `1024`다.
+
+```text
+VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS=1024
+```
+
+### A. Rank-distinct input/routing seed 재측정
+
+측정 조건:
+
+```text
+GPU=2x NVIDIA A100-SXM4-80GB
+backend=deepep_high_throughput
+world_size=2
+hidden=2048
+intermediate=768
+global experts=128
+local experts=64
+top_k=8
+dtype=BF16
+warmup=20
+iters=100
+weight_seed=7
+input_seed_base=1007,2007,3007,4007,5007
+rank0_input_seed=input_seed_base
+rank1_input_seed=input_seed_base + 1
+cycles_per_seed=3
+tokens=1024,2048
+VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS=1024
+VLLM_DEEPEP_HT_NUM_SMS=24
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=0
+NCCL_P2P_DISABLE=0
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_rank_distinct_seed_20260620_raw.csv
+benchmarks/results/deepep_ht_rank_distinct_seed_20260620_commands.log
+```
+
+CSV는 header 포함 91줄, 즉 5 input seeds x 3 cycles x 2 token sizes x
+3 settings = 90 rows이며 누락은 없다.
+
+critical path 절대값:
+
+| tokens | setting | median | IQR | min | max |
+|---:|---|---:|---:|---:|---:|
+| 1024 | baseline | 2036.7 | 32.4 | 1995.2 | 2076.1 |
+| 1024 | global-ignore | 1962.7 | 21.2 | 1933.1 | 1992.7 |
+| 1024 | local-ID-ignore | 1961.2 | 23.5 | 1921.9 | 1994.3 |
+| 2048 | baseline | 2733.6 | 82.0 | 2632.4 | 2982.4 |
+| 2048 | global-ignore | 2613.5 | 32.9 | 2541.6 | 2665.9 |
+| 2048 | local-ID-ignore | 2596.2 | 81.5 | 2474.6 | 2656.9 |
+
+같은 `(input_seed, cycle, tokens)` 안에서 baseline을 뺀 paired 차이:
+
+| tokens | setting | median delta | pct | IQR | min | max | wins |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1024 | global-ignore | -77.4 | -3.80% | 30.7 | -124.1 | -30.1 | 15/15 |
+| 1024 | local-ID-ignore | -72.2 | -3.55% | 27.5 | -104.8 | -22.0 | 15/15 |
+| 2048 | global-ignore | -117.5 | -4.30% | 109.1 | -369.1 | -20.3 | 15/15 |
+| 2048 | local-ID-ignore | -147.9 | -5.41% | 109.9 | -386.3 | -11.1 | 15/15 |
+
+seed별 paired median delta:
+
+| tokens | input_seed_base | global-ignore | local-ID-ignore |
+|---:|---:|---:|---:|
+| 1024 | 1007 | -88.7 | -72.2 |
+| 1024 | 2007 | -61.2 | -85.6 |
+| 1024 | 3007 | -79.1 | -72.2 |
+| 1024 | 4007 | -78.9 | -99.4 |
+| 1024 | 5007 | -44.1 | -71.2 |
+| 2048 | 1007 | -168.1 | -213.9 |
+| 2048 | 2007 | -179.8 | -129.7 |
+| 2048 | 3007 | -56.8 | -93.1 |
+| 2048 | 4007 | -83.9 | -133.5 |
+| 2048 | 5007 | -114.1 | -240.7 |
+
+ignore 활성 여부:
+
+| tokens | setting | rank0 true/total | rank1 true/total | num_tokens r0/r1 median |
+|---:|---|---:|---:|---:|
+| 1024 | baseline | 0/15 | 0/15 | 2040/2041 |
+| 1024 | global-ignore | 15/15 | 15/15 | 2040/2041 |
+| 1024 | local-ID-ignore | 15/15 | 15/15 | 2040/2041 |
+| 2048 | baseline | 0/15 | 0/15 | 4085/4083 |
+| 2048 | global-ignore | 15/15 | 15/15 | 4085/4083 |
+| 2048 | local-ID-ignore | 15/15 | 15/15 | 4085/4083 |
+
+해석:
+
+```text
+1. rank별 input/routing을 다르게 해도 1024/2048에서 ignore-invalid 효과는
+   유지된다.
+
+2. 모든 15개 paired comparison에서 global-ignore와 local-ID-ignore가
+   baseline보다 빨랐다.
+
+3. global-ignore와 local-ID-ignore의 차이는 여전히 일관되지 않다. 핵심
+   효과는 local route-space가 아니라 invalid block 제거다.
+```
+
+### B. 512-token threshold sweep
+
+측정 조건:
+
+```text
+tokens=512
+weight_seed=7
+input_seed_base=1007,2007,3007,4007,5007
+threshold=512,768,896,1024,1280
+cycles=1
+warmup=20
+iters=100
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_threshold_sweep_20260620_raw.csv
+benchmarks/results/deepep_ht_threshold_sweep_20260620_commands.log
+```
+
+CSV는 header 포함 76줄, 즉 5 thresholds x 5 input seeds x 3 settings =
+75 rows이며 누락은 없다.
+
+threshold별 paired delta:
+
+| threshold | setting | median delta | pct | IQR | min | max | wins |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 512 | global-ignore | -53.9 | -3.11% | 14.7 | -64.9 | -37.1 | 5/5 |
+| 512 | local-ID-ignore | -48.1 | -2.78% | 17.6 | -71.1 | -19.0 | 5/5 |
+| 768 | global-ignore | -50.0 | -2.92% | 3.3 | -73.9 | -26.8 | 5/5 |
+| 768 | local-ID-ignore | -47.8 | -2.79% | 32.8 | -70.4 | -2.3 | 5/5 |
+| 896 | global-ignore | -61.6 | -3.57% | 460.6 | -74.0 | +525.0 | 3/5 |
+| 896 | local-ID-ignore | -41.5 | -2.41% | 26.9 | -74.4 | +298.1 | 4/5 |
+| 1024 | global-ignore | -8.1 | -0.47% | 12.9 | -15.6 | +27.2 | 3/5 |
+| 1024 | local-ID-ignore | -11.0 | -0.64% | 32.3 | -35.7 | +433.6 | 4/5 |
+| 1280 | global-ignore | -7.6 | -0.44% | 17.0 | -26.6 | +9.8 | 3/5 |
+| 1280 | local-ID-ignore | -5.2 | -0.30% | 9.4 | -23.8 | -1.1 | 5/5 |
+
+threshold별 ignore 활성 여부:
+
+| threshold | setting | rank0 true/total | rank1 true/total | num_tokens r0/r1 median |
+|---:|---|---:|---:|---:|
+| 512 | global-ignore | 5/5 | 5/5 | 1020/1019 |
+| 512 | local-ID-ignore | 5/5 | 5/5 | 1020/1019 |
+| 768 | global-ignore | 5/5 | 5/5 | 1020/1019 |
+| 768 | local-ID-ignore | 5/5 | 5/5 | 1020/1019 |
+| 896 | global-ignore | 5/5 | 5/5 | 1020/1019 |
+| 896 | local-ID-ignore | 5/5 | 5/5 | 1020/1019 |
+| 1024 | global-ignore | 1/5 | 0/5 | 1020/1019 |
+| 1024 | local-ID-ignore | 1/5 | 0/5 | 1020/1019 |
+| 1280 | global-ignore | 0/5 | 0/5 | 1020/1019 |
+| 1280 | local-ID-ignore | 0/5 | 0/5 | 1020/1019 |
+
+input seed별 512-token received tokens:
+
+| input_seed_base | received r0/r1 |
+|---:|---:|
+| 1007 | 1024/1017 |
+| 2007 | 1021/1019 |
+| 3007 | 1020/1021 |
+| 4007 | 1019/1018 |
+| 5007 | 1018/1020 |
+
+해석:
+
+```text
+1. 기본 threshold=1024는 512 input tokens에서 cliff를 만든다. 이번 seed
+   집합에서는 rank0 1/5만 켜지고 rank1은 0/5만 켜졌다.
+
+2. threshold를 512/768/896으로 낮추면 양 rank가 모두 켜지고 median delta는
+   약 -2.4~-3.6% 범위로 좋아진다.
+
+3. 896에는 큰 outlier가 있어 단일-cycle 결과만으로 특정 threshold를 고르기는
+   어렵다. 다만 threshold=1024가 512-token 이득을 대부분 막는다는 방향은
+   명확하다.
+
+4. 다음 default 후보는 768 또는 512다. default를 바꾸기 전에는 512/768만
+   대상으로 multi-cycle 재측정과 correctness check를 붙이는 것이 안전하다.
 ```

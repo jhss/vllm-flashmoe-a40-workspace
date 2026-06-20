@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE: bool = False
     VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE_MAX_TOKENS: int = 1
     VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS: bool = False
+    VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS: int = 1024
     VLLM_MOE_TRITON_EP_MASKED_ACTIVATION: bool = False
     VLLM_MOE_TRITON_W2_REDUCE_FUSION: bool = False
     VLLM_MOE_TRITON_W2_REDUCE_FUSION_MIN_TOKENS: int = 256
@@ -1450,6 +1451,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # blocks that only write zeros. Experimental, default-off.
     "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": lambda: bool(
         int(os.getenv("VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS", "0"))
+    ),
+    "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS", "1024")
     ),
     # With EP invalid expert skipping enabled, use a masked SiLU+mul kernel
     # that avoids reading/writing activation rows for off-rank expert slots.
