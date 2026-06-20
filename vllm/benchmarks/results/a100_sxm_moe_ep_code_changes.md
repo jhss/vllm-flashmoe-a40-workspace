@@ -1795,3 +1795,182 @@ raw local assignment layout 이후의 expert compute/scheduling 효율이다.
 다음 유효한 방향은 direct assignment 자체보다 DeepEP HT raw/local layout에 맞는
 전용 W1/W2 scheduler 또는 compact local-routed route space다.
 ```
+
+## 15. DeepEP HT assignment builder와 prebuilt GEMM 분리 측정
+
+위 section profile의 `experts` 증가는 `_fused_experts()` 전체 시간이다. 즉 direct
+assignment schedule 생성, W1, activation, W2, reduce가 모두 섞여 있다. 그래서
+아래 진단 벤치를 추가해 schedule 생성과 prebuilt schedule GEMM을 분리했다.
+
+추가한 스크립트:
+
+```text
+benchmarks/kernels/benchmark_deepep_ht_assignment_gemm.py
+```
+
+측정 조건:
+
+```text
+GPU=1x NVIDIA A100-SXM4-80GB on 2x A100 SXM NV12 host
+vLLM commit at measurement=dd9f951b98990e31f65b40326eeec039b5eee1ba
+torch=2.11.0+cu128
+CUDA=12.8
+shape=BF16, hidden=2048, intermediate=768, global experts=128,
+      local experts=64, top_k=8
+tokens=128,512,1024,2048
+BLOCK_SIZE_M sweep=16,32,64,128
+warmup=10
+iters=50
+repeats=3
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG=0
+```
+
+실행 명령:
+
+```bash
+PYTHONPATH=/tmp/vllm_c_stub:$PYTHONPATH \
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG=0 \
+.venv/bin/python benchmarks/kernels/benchmark_deepep_ht_assignment_gemm.py \
+  --output-prefix benchmarks/results/deepep_ht_assignment_gemm_20260620
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_assignment_gemm_20260620_assignment.csv
+benchmarks/results/deepep_ht_assignment_gemm_20260620_components.csv
+benchmarks/results/deepep_ht_assignment_gemm_20260620_gemm.csv
+benchmarks/results/deepep_ht_assignment_gemm_20260620.metadata.json
+benchmarks/results/deepep_ht_assignment_gemm_20260620.commands.log
+```
+
+CSV/log/json은 `.gitignore` 대상이라 git에는 추가하지 않았다. 이 벤치는 실제
+분산 DeepEP dispatch를 다시 실행하지 않고, 동일한 synthetic global top-k를
+DeepEP HT receiver-local raw id와 local sentinel id로 투영해 assignment/GEMM
+입력 분포를 고정한다. 따라서 목적은 end-to-end latency가 아니라 병목 분해다.
+
+### A. Assignment-only 결과
+
+actual GEMM config의 `BLOCK_SIZE_M`은 tokens 128/512에서 64, 1024/2048에서
+128이었다.
+
+| tokens | BM | generic global | local-ID generic | direct | direct-local | generic ignore | local-ID ignore | direct ignore | direct-local ignore |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 64 | 43.1 | 43.0 | 235.0 | +192.0 | 26.0 | 24.1 | 161.9 | +137.8 |
+| 512 | 64 | 43.0 | 43.2 | 232.6 | +189.4 | 24.1 | 25.3 | 162.0 | +136.7 |
+| 1024 | 128 | 42.6 | 43.6 | 232.9 | +189.3 | 25.2 | 24.1 | 161.0 | +137.0 |
+| 2048 | 128 | 43.1 | 43.2 | 231.8 | +188.6 | 24.5 | 24.6 | 159.9 | +135.4 |
+
+전체 `BLOCK_SIZE_M=16,32,64,128` sweep에서도 같은 패턴이었다.
+
+```text
+ignore-invalid=0: direct - local-ID generic = +174.4 ~ +192.0 us
+ignore-invalid=1: direct - local-ID generic = +135.4 ~ +140.5 us
+```
+
+즉 이전 end-to-end에서 보였던 direct의 약 190~220 us 고정 penalty는 대부분
+assignment builder 자체에서 재현된다.
+
+direct helper를 쪼개 잰 isolated component timing은 아래와 같다. 이 값들은
+각 component를 따로 반복 측정한 것이므로 정확히 더해지는 end-to-end breakdown은
+아니지만, 비용 위치를 보여준다.
+
+| tokens | BM | ignore | counts | prefix_sum | alloc_init | fill_ids | scatter_ids | component sum |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 64 | 0 | 51.6 | 74.8 | 20.1 | 14.5 | 20.6 | 181.6 |
+| 128 | 64 | 1 | 0.4 | 74.3 | 20.0 | 14.1 | 20.6 | 129.4 |
+| 512 | 64 | 0 | 52.8 | 74.5 | 20.1 | 13.3 | 20.7 | 181.5 |
+| 512 | 64 | 1 | 0.4 | 73.6 | 20.1 | 14.6 | 20.4 | 129.1 |
+| 1024 | 128 | 0 | 51.1 | 73.6 | 20.2 | 13.3 | 20.6 | 178.8 |
+| 1024 | 128 | 1 | 0.4 | 73.5 | 20.1 | 14.6 | 20.5 | 129.0 |
+| 2048 | 128 | 0 | 51.0 | 76.9 | 20.9 | 14.7 | 21.2 | 184.7 |
+| 2048 | 128 | 1 | 0.4 | 76.1 | 20.6 | 15.3 | 20.9 | 133.3 |
+
+가장 큰 고정 비용은 `prefix_sum` 계열의 작은 PyTorch GPU op 누적이고,
+`ignore-invalid=0`에서는 invalid count 생성을 위한 `counts.sum`, scalar 생성,
+`torch.cat` 경로가 약 51 us 추가된다. allocation/init와 두 Triton kernel도 각각
+작지만 고정 비용으로 누적된다.
+
+### B. Prebuilt schedule GEMM 결과
+
+schedule을 timing loop 밖에서 한 번만 만든 뒤 W1, activation, W2, reduce,
+full expert path를 측정했다. 아래 표는 `W1 + activation + W2 + reduce` 전체다.
+
+| tokens | ignore | generic global | local-ID generic | direct | direct-local |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 0 | 409.2 | 425.4 | 411.7 | -13.8 |
+| 128 | 1 | 398.0 | 397.1 | 397.6 | +0.6 |
+| 512 | 0 | 448.7 | 448.4 | 448.3 | -0.1 |
+| 512 | 1 | 437.6 | 436.5 | 436.5 | -0.0 |
+| 1024 | 0 | 591.0 | 584.6 | 584.6 | -0.0 |
+| 1024 | 1 | 567.9 | 566.1 | 567.5 | +1.4 |
+| 2048 | 0 | 830.9 | 818.8 | 818.7 | -0.1 |
+| 2048 | 1 | 768.3 | 765.3 | 765.1 | -0.1 |
+
+512 tokens 이상에서는 prebuilt direct가 local-ID generic과 사실상 같다. 즉 direct
+schedule의 내부 순서나 block 구성이 W1/W2 GEMM을 느리게 만든다는 증거는 없다.
+1024/2048에서 generic global이 조금 느린 것은 global invalid expert들을 더 많이
+schedule에 남기는 구조 차이와 일치한다.
+
+대표 phase breakdown:
+
+| tokens | ignore | phase | generic global | local-ID generic | direct |
+|---:|---:|---|---:|---:|---:|
+| 1024 | 0 | W1 | 339.4 | 339.6 | 339.3 |
+| 1024 | 0 | W2 | 204.2 | 198.2 | 197.5 |
+| 1024 | 0 | reduce | 29.7 | 29.7 | 29.6 |
+| 1024 | 1 | W1 | 333.1 | 333.1 | 333.3 |
+| 1024 | 1 | W2 | 184.3 | 183.9 | 185.6 |
+| 1024 | 1 | reduce | 33.2 | 34.6 | 34.4 |
+| 2048 | 0 | W1 | 451.5 | 446.4 | 446.1 |
+| 2048 | 0 | W2 | 285.4 | 278.3 | 278.4 |
+| 2048 | 0 | reduce | 53.3 | 53.3 | 53.3 |
+| 2048 | 1 | W1 | 433.4 | 432.8 | 432.6 |
+| 2048 | 1 | W2 | 259.8 | 257.9 | 257.9 |
+| 2048 | 1 | reduce | 34.4 | 33.8 | 34.7 |
+
+### C. Schedule 구조 비교
+
+local-ID generic과 direct는 모든 actual BM 조건에서 동일한 schedule 구조를 만든다.
+generic global만 off-rank expert들을 global expert space에 따로 padding해서 더 큰
+schedule이 된다.
+
+| tokens | BM | ignore | generic post | generic valid/invalid blocks | local/direct post | local/direct valid/invalid blocks |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 64 | 0 | 8128 | 63 / 64 | 4544 | 63 / 8 |
+| 128 | 64 | 1 | 4032 | 63 / 0 | 4032 | 63 / 0 |
+| 512 | 64 | 0 | 8192 | 64 / 64 | 6208 | 64 / 33 |
+| 512 | 64 | 1 | 4096 | 64 / 0 | 4096 | 64 / 0 |
+| 1024 | 128 | 0 | 16384 | 64 / 64 | 12416 | 64 / 33 |
+| 1024 | 128 | 1 | 8192 | 64 / 0 | 8192 | 64 / 0 |
+| 2048 | 128 | 0 | 24320 | 98 / 92 | 20736 | 98 / 64 |
+| 2048 | 128 | 1 | 12544 | 98 / 0 | 12544 | 98 / 0 |
+
+### 결론 수정
+
+이번 분리 측정 결과, 이전 section profile의 `experts` 증가를 W1/W2 GEMM
+효율 저하로 해석하면 안 된다.
+
+```text
+prebuilt direct schedule GEMM ~= local-ID generic GEMM
+direct assignment builder ~= local-ID generic align + 135~192 us
+```
+
+따라서 다음 우선순위는 새 W1/W2 scheduler가 아니라 direct assignment builder의
+고정 비용 제거다.
+
+구체적으로는 다음이 더 유효하다.
+
+```text
+1. expert count 확장, padded count, prefix sum, expert_offsets 생성을
+   하나의 CUDA/Triton helper로 fusion
+2. sorted_token_ids, expert_ids, write cursor buffer를 재사용하거나 workspace에서
+   받아 allocation/init 비용 제거
+3. include-invalid 경로의 counts.sum + torch.cat 제거
+4. fill_expert_ids와 scatter_token_ids를 하나의 schedule-build kernel로 합치거나,
+   적어도 host launch 수를 줄이기
+```
+
+`ignore-invalid`는 여전히 긍정적인 방향이다. builder 고정 비용이 제거되면 큰
+prefill에서는 local/direct route-space의 작은 schedule과 invalid block 제거가
+end-to-end win으로 이어질 가능성이 높다.
