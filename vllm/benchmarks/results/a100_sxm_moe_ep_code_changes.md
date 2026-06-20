@@ -1667,3 +1667,131 @@ VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1 단독이다.
 VLLM_MOE_TRITON_EP_MASKED_ACTIVATION=1은 experts 구간 개선은 있으나
 전체 latency 효과가 작으므로 보조/후속 실험 후보로 둔다.
 ```
+
+## 14. DeepEP HT direct assignment 성능 측정
+
+`deepep_high_throughput` backend에서 direct assignment 경로를 실제 forward 기준으로
+측정했다. 이번 측정은 section profiler가 direct assignment의 raw local expert id와
+`DeepEPHTLocalRaw` metadata를 보존하도록 수정한 뒤 수행했다.
+
+환경:
+
+```text
+commit=d4968a611 이후 로컬 benchmark_moe_ep_a40.py 수정 포함
+GPU=2x NVIDIA A100-SXM4-80GB, NV12
+DeepEP=deep-ep==1.1.0+be8053d
+DeepEP build=SM80, DISABLE_SM90_FEATURES=1, DISABLE_NVSHMEM=1
+vLLM DeepEP detection: has_deep_ep=True, has_deep_ep_v2=False
+backend=deepep_high_throughput
+VLLM_DEEPEP_HT_NUM_SMS=24
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG=0
+NCCL_P2P_DISABLE=0
+```
+
+공통 shape:
+
+```text
+world_size=2
+hidden=2048
+intermediate=768
+global experts=128
+local experts=64
+top_k=8
+dtype=BF16
+warmup=20
+iters=100
+independent runs=5
+대표 latency=critical_path_us=max(rank0_forward_us, rank1_forward_us)
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_direct_assignment_20260620_raw.csv
+benchmarks/results/deepep_ht_direct_assignment_20260620_summary.csv
+benchmarks/results/deepep_ht_direct_assignment_20260620_commands.log
+```
+
+CSV/log는 `.gitignore`의 `*.csv`/`*.log` 대상이라 git에는 추가하지 않았다.
+
+end-to-end median critical path:
+
+| tokens | baseline | local-ID | direct assignment | direct + ignore-invalid |
+|---:|---:|---:|---:|---:|
+| 128 | 1447.1 us | 1443.7 us | 1657.8 us | 1638.7 us |
+| 512 | 1722.7 us | 1723.1 us | 1914.7 us | 1915.2 us |
+| 1024 | 2054.5 us | 2051.0 us | 2248.0 us | 2102.2 us |
+| 2048 | 2717.7 us | 2690.9 us | 2938.9 us | 2739.9 us |
+
+min/max/IQR:
+
+| tokens | 설정 | median | min | max | IQR |
+|---:|---|---:|---:|---:|---:|
+| 128 | baseline | 1447.1 | 1441.3 | 1491.4 | 25.3 |
+| 128 | local-ID | 1443.7 | 1423.5 | 2016.9 | 312.8 |
+| 128 | direct | 1657.8 | 1650.7 | 1661.5 | 8.5 |
+| 128 | direct + ignore-invalid | 1638.7 | 1627.0 | 1662.0 | 28.6 |
+| 512 | baseline | 1722.7 | 1715.7 | 1747.3 | 25.5 |
+| 512 | local-ID | 1723.1 | 1695.4 | 2224.8 | 282.8 |
+| 512 | direct | 1914.7 | 1896.3 | 2036.1 | 95.8 |
+| 512 | direct + ignore-invalid | 1915.2 | 1851.7 | 1981.2 | 85.2 |
+| 1024 | baseline | 2054.5 | 1986.9 | 2058.7 | 43.0 |
+| 1024 | local-ID | 2051.0 | 2042.3 | 2078.1 | 23.2 |
+| 1024 | direct | 2248.0 | 2186.4 | 2267.3 | 51.2 |
+| 1024 | direct + ignore-invalid | 2102.2 | 2091.4 | 2125.8 | 27.7 |
+| 2048 | baseline | 2717.7 | 2629.3 | 2767.5 | 82.2 |
+| 2048 | local-ID | 2690.9 | 2688.7 | 2745.4 | 34.3 |
+| 2048 | direct | 2938.9 | 2841.6 | 2966.5 | 112.4 |
+| 2048 | direct + ignore-invalid | 2739.9 | 2657.4 | 2793.9 | 81.9 |
+
+해석:
+
+```text
+direct assignment 단독은 모든 token size에서 baseline보다 느렸다.
+local-ID ablation은 baseline과 거의 동률이거나 약간 빠른 수준이며, direct
+assignment의 손실을 설명하지 못한다.
+
+direct + ignore-invalid는 direct 단독의 손실을 줄인다. 특히 tokens=1024에서
+2248.0 us -> 2102.2 us로 약 146 us 회복했다. 하지만 baseline 2054.5 us와
+local-ID 2051.0 us보다 여전히 느리다.
+
+따라서 현재 A100/DeepEP HT/BF16 synthetic shape에서는 direct assignment를
+성능 최적화로 유지할 근거가 없다. benchmark/debug용 경로로 남기거나,
+전용 W1/W2 scheduler가 expert compute 구간의 손실을 없애기 전까지는
+기본 활성화하지 않는 것이 맞다.
+```
+
+tokens=1024 section profile도 확인했다. 표는 rank0/rank1 중 느린 쪽의 평균이다.
+
+조건:
+
+```text
+warmup=5
+iters=20
+section-profile-warmup=2
+section-profile-iters=10
+```
+
+| 설정 | prepare | experts | finalize | dispatch submit | dispatch receiver | top-k remap | metadata | post quant | combine submit | combine copy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 477.3 us | 1322.1 us | 261.6 us | 227.2 us | 220.6 us | 99.8 us | 53.8 us | 9.5 us | 198.3 us | 30.5 us |
+| local-ID | 647.8 us | 1498.4 us | 317.4 us | 251.6 us | 336.0 us | 150.3 us | 73.0 us | 16.1 us | 216.7 us | 46.3 us |
+| direct | 418.1 us | 1576.4 us | 294.0 us | 244.0 us | 141.8 us | 11.9 us | 63.3 us | 10.2 us | 227.9 us | 31.6 us |
+| direct + ignore-invalid | 396.7 us | 1393.3 us | 255.4 us | 219.9 us | 141.7 us | 12.0 us | 64.4 us | 8.8 us | 191.0 us | 31.4 us |
+
+section 해석:
+
+```text
+direct assignment는 receiver prepare를 줄인다. top-k remap은 baseline
+99.8 us에서 direct 약 12 us로 줄고, dispatch receiver도 220.6 us에서
+141.8 us로 줄었다.
+
+하지만 direct assignment 단독은 experts 구간이 1322.1 us -> 1576.4 us로
+약 254 us 늘어 전체 성능을 잃는다. direct + ignore-invalid는 experts 구간을
+1393.3 us까지 낮춰 손실을 줄이지만, 여전히 baseline보다 약 71 us 느리다.
+
+결론적으로 현재 direct assignment의 문제는 receiver remap 제거가 아니라
+raw local assignment layout 이후의 expert compute/scheduling 효율이다.
+다음 유효한 방향은 direct assignment 자체보다 DeepEP HT raw/local layout에 맞는
+전용 W1/W2 scheduler 또는 compact local-routed route space다.
+```

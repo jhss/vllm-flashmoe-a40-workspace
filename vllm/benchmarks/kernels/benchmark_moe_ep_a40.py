@@ -74,6 +74,9 @@ class BenchResult:
     warmup: int
     iters: int
     full_forward_us: float
+    rank0_forward_us: float
+    rank1_forward_us: float | None
+    critical_path_us: float
     topk_us: float | None
     dispatch_us: float | None
     combine_us: float | None
@@ -446,23 +449,42 @@ def _wrap_deepep_ht_receiver_details(
 
         with profiler.section("deepep_receiver_topk_remap"):
             assert expert_topk_ids is not None
-            if deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
-                invalid_expert_id = len(expert_num_tokens_per_expert_list)
-                rank_expert_offset = 0
-            else:
+            use_direct_assignment = self._preserve_raw_local_ids
+            use_local_expert_ids = (
+                deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
+                or use_direct_assignment
+            )
+            if not use_direct_assignment and use_local_expert_ids:
+                local_num_experts = len(expert_num_tokens_per_expert_list)
+                expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
+                    expert_topk_ids,
+                    local_num_experts,
+                    0,
+                )
+            elif not use_direct_assignment:
                 invalid_expert_id = (
                     num_experts - 1 if self.rank_expert_offset == 0 else 0
                 )
-                rank_expert_offset = self.rank_expert_offset
-            expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
-                expert_topk_ids,
-                invalid_expert_id,
-                rank_expert_offset,
-            )
+                expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
+                    expert_topk_ids,
+                    invalid_expert_id,
+                    self.rank_expert_offset,
+                )
 
         with profiler.section("deepep_receiver_metadata"):
+            assignment_layout = (
+                mk_module.ExpertAssignmentLayout.DeepEPHTLocalRaw
+                if use_direct_assignment
+                else (
+                    mk_module.ExpertAssignmentLayout.DeepEPHTLocalSentinel
+                    if use_local_expert_ids
+                    else mk_module.ExpertAssignmentLayout.Generic
+                )
+            )
             expert_tokens_meta = mk_module.ExpertTokensMetadata.make_from_list(
-                expert_num_tokens_per_expert_list, device=expert_x.device
+                expert_num_tokens_per_expert_list,
+                device=expert_x.device,
+                assignment_layout=assignment_layout,
             )
 
         if not quant_config.is_block_quantized and not defer_input_quant:
@@ -702,6 +724,14 @@ def run_worker(
                 return layer(hidden_states, router_logits)
 
         full_forward_us = time_cuda(forward_once, args.warmup, args.iters)
+        local_latency = torch.tensor(
+            [full_forward_us], dtype=torch.float64, device=device
+        )
+        rank_latencies_tensor = [
+            torch.empty_like(local_latency) for _ in range(args.world_size)
+        ]
+        torch.distributed.all_gather(rank_latencies_tensor, local_latency)
+        rank_forward_us = [latency.item() for latency in rank_latencies_tensor]
         run_section_profile(args, rank, forward_once)
         run_torch_kernel_profile(args, rank, forward_once)
 
@@ -776,6 +806,9 @@ def run_worker(
             warmup=args.warmup,
             iters=args.iters,
             full_forward_us=full_forward_us,
+            rank0_forward_us=rank_forward_us[0],
+            rank1_forward_us=rank_forward_us[1] if args.world_size > 1 else None,
+            critical_path_us=max(rank_forward_us),
             topk_us=topk_us,
             dispatch_us=dispatch_us,
             combine_us=combine_us,
