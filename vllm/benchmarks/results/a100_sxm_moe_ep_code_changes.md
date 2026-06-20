@@ -1572,3 +1572,98 @@ atomic add 비용이 커서 느렸다.
 
 따라서 현재 추천 경로는 W2 atomic reduce fusion이 아니라
 `ignore-invalid + masked activation`이다.
+
+## 13. 2026-06-20 A100 SXM 재현 실험
+
+`AGENTS.md`의 즉시 실험 큐를 기준으로 현재 워크스페이스의 최신 EP Triton
+커널 후보를 다시 검증했다. 대상은 `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS`와
+`VLLM_MOE_TRITON_EP_MASKED_ACTIVATION` 조합이다.
+
+환경:
+
+```text
+commit=3f556a52b61b5dd685366bc4c92382ca73d1d923
+GPU=2x NVIDIA A100-SXM4-80GB, NV12
+driver=570.172.08
+CUDA toolkit=12.8.93
+torch=2.11.0+cu128
+torch CUDA=12.8
+triton=3.6.0
+vllm=0.23.1.dev0
+```
+
+환경 메모:
+
+```text
+VLLM_USE_PRECOMPILED=1 editable install을 사용했다.
+precompiled wheel에는 vllm._C_stable_libtorch와 vllm._moe_C_stable_libtorch는
+있지만 vllm._C가 없어 CUDA platform import가 실패했다.
+이번 벤치마크에서는 파일 변경 없이 /tmp/vllm_c_stub/sitecustomize.py로
+vllm._C import만 stub 처리했고, MoE stable extension들은 정상 로드됐다.
+```
+
+Correctness smoke:
+
+```text
+tests/kernels/moe/test_deepep_ht_expert_assignment.py
+52 passed
+```
+
+성능 조건:
+
+```text
+NCCL_P2P_DISABLE=0
+world_size=2
+backend=allgather_reducescatter
+tokens=1024
+hidden=2048
+intermediate=768
+num_experts=128
+local_experts=64
+top_k=8
+dtype=BF16
+warmup=10
+iters=50
+```
+
+end-to-end:
+
+| 설정 | full forward | baseline 대비 |
+|---|---:|---:|
+| baseline | 1869.2 us | - |
+| W1+W2 tuned | 1831.6 us | 2.0% 개선 |
+| W1+W2 tuned + ignore invalid experts | 1567.5 us | 16.1% 개선 |
+| W1+W2 tuned + ignore invalid + masked activation | 1590.4 us | 14.9% 개선 |
+
+해석:
+
+```text
+ignore-invalid expert assignment는 이번 재현 런에서도 명확히 이겼다.
+W1+W2 tuned 위에 추가했을 때 full forward가 1831.6 us -> 1567.5 us로
+약 14.4% 더 줄었다.
+
+반면 masked activation은 이번 50-iteration end-to-end 런에서는
+1567.5 us -> 1590.4 us로 소폭 악화됐다. 단일 실행 기준으로는
+전체 latency에서 안정적인 이득이라고 보기 어렵다.
+```
+
+짧은 section profile도 비교했다. 조건은 같은 shape에서 warmup=5/iters=20,
+section-profile-warmup=2/section-profile-iters=10이다.
+
+| 설정 | rank0 experts | rank1 experts | rank0 prepare | rank1 prepare |
+|---|---:|---:|---:|---:|
+| ignore invalid experts | 1028.0 us | 1007.4 us | 195.7 us | 200.3 us |
+| ignore invalid + masked activation | 1007.4 us | 1001.3 us | 211.9 us | 190.0 us |
+
+section 해석:
+
+```text
+masked activation은 experts 구간만 보면 rank0 약 20.6 us, rank1 약 6.0 us를
+줄였다. 하지만 prepare/finalize 변동과 전체 실행 노이즈에 묻혀 end-to-end
+latency 개선으로는 안정적으로 나타나지 않았다.
+
+따라서 이번 재현 결과 기준의 추천 경로는
+VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1 단독이다.
+VLLM_MOE_TRITON_EP_MASKED_ACTIVATION=1은 experts 구간 개선은 있으나
+전체 latency 효과가 작으므로 보조/후속 실험 후보로 둔다.
+```
