@@ -2434,11 +2434,14 @@ ignore 활성 여부:
 1. rank별 input/routing을 다르게 해도 1024/2048에서 ignore-invalid 효과는
    유지된다.
 
-2. 모든 15개 paired comparison에서 global-ignore와 local-ID-ignore가
-   baseline보다 빨랐다.
+2. 5개의 독립적인 rank-distinct routing seed에서 모두 개선됐고, 각 seed를
+   3회 반복한 총 15회의 paired run에서 global-ignore와 local-ID-ignore가
+   모두 baseline보다 빨랐다.
 
 3. global-ignore와 local-ID-ignore의 차이는 여전히 일관되지 않다. 핵심
-   효과는 local route-space가 아니라 invalid block 제거다.
+   효과는 local route-space가 아니라 invalid block 제거다. 포트폴리오
+   대표 결과는 더 단순한 global generic + ignore-invalid로 잡는 편이
+   안전하다.
 ```
 
 ### B. 512-token threshold sweep
@@ -2505,19 +2508,216 @@ input seed별 512-token received tokens:
 | 4007 | 1019/1018 |
 | 5007 | 1018/1020 |
 
+해석 수정:
+
+```text
+1. 이 sweep은 threshold=512/768/896의 kernel 성능 차이를 비교한 것이 아니다.
+   512 input tokens에서 실제 received tokens는 약 1017~1024였으므로,
+   threshold=512/768/896은 모두 양 rank에서 같은 ignore path를 실행한다.
+   세 값 사이의 차이는 threshold 효과가 아니라 실행 노이즈다.
+
+2. threshold=1024는 rank0 1/5만 켜지고 rank1은 0/5만 켜지는 비대칭
+   partial activation 조건이다. threshold=1280은 양 rank 모두 꺼진다.
+   따라서 1024/1280 결과는 mostly baseline/off 경로에 가깝다.
+
+3. 896 global/local-ID와 1024 local-ID에는 여러 transient outlier가 있다.
+   seed당 cycle=1이고 실행 순서도 baseline -> global -> local로 고정됐으므로
+   순서/thermal/background noise를 분리하기 어렵다.
+
+4. 다음 실험은 threshold 값 자체가 아니라 실제 received-M을 변화시키면서
+   ignore OFF와 forced ON을 paired로 비교해 break-even 지점을 찾는 것이다.
+```
+
+## 19. Received-M break-even: ignore OFF vs forced ON
+
+Section 18B의 threshold sweep은 `threshold=512/768/896`이 모두 같은 실행
+경로를 켜는 조건이었기 때문에 threshold 값 자체의 비교가 아니었다. 이번에는
+실제 received token 수를 바꾸면서 global generic ignore-invalid를 강제로 켰다.
+
+분석 스크립트도 기존 paired CSV뿐 아니라 rank-distinct, threshold sweep,
+break-even CSV를 모두 처리하도록 확장했다.
+
+```text
+benchmarks/results/analyze_deepep_ht_paired.py
+```
+
+스크립트는 다음 key를 자동으로 사용한다.
+
+```text
+basic paired:
+  (cycle, tokens, setting)
+
+rank-distinct:
+  (input_seed_group, cycle, tokens, setting)
+
+threshold sweep:
+  (threshold, input_seed_group, cycle, tokens, setting)
+```
+
+paired table에는 다음을 함께 출력한다.
+
+```text
+min(received_tokens_rank0, received_tokens_rank1)
+critical rank의 received tokens
+median(delta)
+median(delta) / median(baseline)
+median(pairwise delta / baseline)
+wins / total
+positive delta outlier rows
+rank별 activation
+```
+
+측정 조건:
+
+```text
+base_commit=5b2044614
+GPU=2x NVIDIA A100-SXM4-80GB
+backend=deepep_high_throughput
+world_size=2
+hidden=2048
+intermediate=768
+global experts=128
+local experts=64
+top_k=8
+dtype=BF16
+warmup=20
+iters=100
+weight_seed=7
+input_seed_base=1007,2007,3007,4007,5007
+rank0_input_seed=input_seed_base
+rank1_input_seed=input_seed_base + 1
+cycles_per_seed=3
+tokens=128,192,256,320,384,448,512,640,768
+VLLM_DEEPEP_HT_NUM_SMS=24
+VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=0
+VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=0
+NCCL_P2P_DISABLE=0
+```
+
+설정:
+
+```text
+baseline:
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=0
+
+global-ignore forced ON:
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS=0
+```
+
+측정 파일:
+
+```text
+benchmarks/results/deepep_ht_break_even_m_20260620_raw.csv
+benchmarks/results/deepep_ht_break_even_m_20260620_commands.log
+```
+
+CSV는 header 포함 271줄, 즉 5 seeds x 3 cycles x 9 token sizes x
+2 settings = 270 rows이며 누락은 없다.
+
+critical path 절대값:
+
+| tokens | baseline median | forced ON median | min/max baseline | min/max forced ON |
+|---:|---:|---:|---:|---:|
+| 128 | 1446.3 | 1410.4 | 1437.4/1517.6 | 1398.0/1566.5 |
+| 192 | 1475.4 | 1429.2 | 1443.9/1651.4 | 1412.3/1507.3 |
+| 256 | 1496.1 | 1452.0 | 1479.1/2075.1 | 1429.6/1544.1 |
+| 320 | 1671.0 | 1629.8 | 1648.9/1681.6 | 1599.4/1749.7 |
+| 384 | 1694.7 | 1636.2 | 1671.1/1753.3 | 1618.5/1675.6 |
+| 448 | 1715.9 | 1651.1 | 1691.9/2307.1 | 1636.3/2167.9 |
+| 512 | 1732.9 | 1669.0 | 1713.1/1773.2 | 1651.9/1702.9 |
+| 640 | 1762.8 | 1681.6 | 1704.6/2287.1 | 1670.6/1887.3 |
+| 768 | 1805.0 | 1712.5 | 1765.2/1874.3 | 1692.7/2221.1 |
+
+paired delta. `delta/median baseline`은 `median(delta) / median(baseline)`,
+`pair pct`는 각 pair의 `(ON - OFF) / OFF`를 계산한 뒤 median을 낸 값이다.
+
+| input tokens | min recv median | critical recv median | ON-OFF median | pair pct | IQR | wins |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 254 | 255 | -32.3 | -2.24% | 18.9 | 14/15 |
+| 192 | 382 | 383 | -44.5 | -3.04% | 26.3 | 13/15 |
+| 256 | 509 | 510 | -44.1 | -2.97% | 33.4 | 13/15 |
+| 320 | 637 | 638 | -43.6 | -2.61% | 16.4 | 14/15 |
+| 384 | 765 | 765 | -55.3 | -3.27% | 21.9 | 15/15 |
+| 448 | 890 | 892 | -53.6 | -3.12% | 36.4 | 13/15 |
+| 512 | 1018 | 1019 | -67.5 | -3.92% | 26.7 | 15/15 |
+| 640 | 1273 | 1274 | -82.0 | -4.67% | 31.5 | 14/15 |
+| 768 | 1528 | 1529 | -97.1 | -5.39% | 39.2 | 14/15 |
+
+seed별 paired median delta:
+
+| tokens | 1007 | 2007 | 3007 | 4007 | 5007 |
+|---:|---:|---:|---:|---:|---:|
+| 128 | -26.2 | -28.1 | -32.3 | -35.1 | -44.7 |
+| 192 | -60.8 | -53.6 | -38.1 | +18.4 | -58.1 |
+| 256 | -34.0 | -41.9 | -44.1 | -56.3 | -64.6 |
+| 320 | -50.3 | -36.1 | -42.5 | -46.3 | -29.4 |
+| 384 | -69.7 | -59.1 | -45.2 | -42.6 | -55.3 |
+| 448 | -65.1 | -45.2 | -53.6 | -45.8 | -52.5 |
+| 512 | -54.2 | -67.5 | -47.9 | -77.3 | -70.3 |
+| 640 | -82.0 | -67.0 | -85.3 | -89.9 | -72.9 |
+| 768 | -103.7 | -53.7 | -99.4 | -64.7 | -125.7 |
+
+activation sanity:
+
+| tokens | baseline active r0/r1 | forced ON active r0/r1 | recv r0/r1 median |
+|---:|---:|---:|---:|
+| 128 | 0/15, 0/15 | 15/15, 15/15 | 255/255 |
+| 192 | 0/15, 0/15 | 15/15, 15/15 | 383/383 |
+| 256 | 0/15, 0/15 | 15/15, 15/15 | 510/509 |
+| 320 | 0/15, 0/15 | 15/15, 15/15 | 638/637 |
+| 384 | 0/15, 0/15 | 15/15, 15/15 | 766/765 |
+| 448 | 0/15, 0/15 | 15/15, 15/15 | 892/892 |
+| 512 | 0/15, 0/15 | 15/15, 15/15 | 1020/1019 |
+| 640 | 0/15, 0/15 | 15/15, 15/15 | 1276/1274 |
+| 768 | 0/15, 0/15 | 15/15, 15/15 | 1532/1529 |
+
+대표 assignment stats:
+
+| tokens | baseline mode | forced ON mode |
+|---:|---|---|
+| 128 | `64:5120/64/16` / `64:5184/64/17` | `64:4096/64/0` / `64:4096/64/0` |
+| 192 | `64:5632/64/24` / `64:5632/64/24` | `64:4096/64/0` / `64:4096/64/0` |
+| 256 | `64:6144/64/32` / `64:6144/64/32` | `64:4096/64/0` / `64:4096/64/0` |
+| 320 | `128:10752/64/20` / `128:10752/64/20` | `128:8192/64/0` / `128:8192/64/0` |
+| 384 | `128:11264/64/24` / `128:11264/64/24` | `128:8192/64/0` / `128:8192/64/0` |
+| 448 | `128:11776/64/28` / `128:11776/64/28` | `128:8192/64/0` / `128:8192/64/0` |
+| 512 | `128:12288/64/32` / `128:12288/64/32` | `128:8192/64/0` / `128:8192/64/0` |
+| 640 | `128:13312/64/40` / `128:13312/64/40` | `128:8192/64/0` / `128:8192/64/0` |
+| 768 | `128:14336/64/48` / `128:14336/64/48` | `128:8192/64/0` / `128:8192/64/0` |
+
+positive delta outliers:
+
+| tokens | input_seed | cycle | delta |
+|---:|---:|---:|---:|
+| 128 | 5007 | 2 | +94.6 |
+| 192 | 4007 | 2 | +28.4 |
+| 192 | 4007 | 3 | +18.4 |
+| 256 | 1007 | 2 | +0.7 |
+| 256 | 2007 | 2 | +42.1 |
+| 320 | 5007 | 2 | +72.2 |
+| 448 | 3007 | 3 | +451.9 |
+| 448 | 5007 | 2 | +5.7 |
+| 640 | 2007 | 3 | +108.1 |
+| 768 | 4007 | 2 | +433.2 |
+
 해석:
 
 ```text
-1. 기본 threshold=1024는 512 input tokens에서 cliff를 만든다. 이번 seed
-   집합에서는 rank0 1/5만 켜지고 rank1은 0/5만 켜졌다.
+1. 이번 범위에서는 break-even M이 관측되지 않았다. 가장 작은 input=128,
+   min received ~=254에서도 forced ON은 median -32.3 us, -2.24%로 이겼다.
 
-2. threshold를 512/768/896으로 낮추면 양 rank가 모두 켜지고 median delta는
-   약 -2.4~-3.6% 범위로 좋아진다.
+2. 384와 512 tokens에서는 15/15 paired run이 모두 이겼고, 128/320/640/768도
+   14/15로 대부분 이겼다.
 
-3. 896에는 큰 outlier가 있어 단일-cycle 결과만으로 특정 threshold를 고르기는
-   어렵다. 다만 threshold=1024가 512-token 이득을 대부분 막는다는 방향은
-   명확하다.
+3. 몇 개 큰 positive outlier가 있어 default 변경 전 correctness와 한 번 더
+   짧은 confirmation run은 필요하다. 그래도 median과 seed별 median은
+   forced ON 우세로 일관된다.
 
-4. 다음 default 후보는 768 또는 512다. default를 바꾸기 전에는 512/768만
-   대상으로 multi-cycle 재측정과 correctness check를 붙이는 것이 안전하다.
+4. 현재 데이터만 보면 `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS`
+   기본 후보는 1024보다 훨씬 낮아야 한다. 보수적인 후보는 received-M 256
+   또는 384이고, aggressive하게는 0도 가능해 보인다.
+
+5. 다음 코드는 global generic + ignore-invalid를 주력 경로로 유지하되,
+   local-ID나 direct assignment를 default 후보로 삼을 근거는 여전히 없다.
 ```
