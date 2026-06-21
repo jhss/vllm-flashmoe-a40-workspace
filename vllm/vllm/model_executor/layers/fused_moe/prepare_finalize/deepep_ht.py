@@ -125,9 +125,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "backend that supports DeepEP HT raw local top-k ids."
             )
         if fused_experts.moe_config.is_lora_enabled:
-            raise ValueError(
-                "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT does not support LoRA."
-            )
+            raise ValueError("VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT does not support LoRA.")
         quant_config = fused_experts.quant_config
         if (
             quant_config.use_fp8_w8a8
@@ -181,8 +179,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         device: torch.device,
     ) -> tuple[int, torch.Tensor | None]:
         use_local_expert_ids = (
-            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
-            or self._preserve_raw_local_ids
+            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or self._preserve_raw_local_ids
         )
         if not use_local_expert_ids:
             return global_num_experts, expert_map
@@ -200,6 +197,39 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if self.num_dispatchers_ not in self.available_rank_configs:
             return None
         return deep_ep.Buffer.get_combine_config(self.num_dispatchers_)
+
+    def _fixed_capacity_num_worst_tokens(self, tokens: torch.Tensor) -> int:
+        if not envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH:
+            return 0
+        if self.buffer.runtime.get_num_rdma_ranks() > 1:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires intranode "
+                "DeepEP HT dispatch."
+            )
+        if (
+            envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
+            or envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
+        ):
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH currently requires "
+                "generic global expert IDs."
+            )
+        if not envs.VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires "
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1 so padded "
+                "top-k rows are filtered downstream."
+            )
+        num_worst_tokens = envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS
+        if num_worst_tokens <= 0:
+            num_worst_tokens = tokens.size(0) * self.dp_size
+        if num_worst_tokens < tokens.size(0):
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS must be at "
+                f"least the local token count ({tokens.size(0)}), got "
+                f"{num_worst_tokens}."
+            )
+        return num_worst_tokens
 
     def _do_dispatch(
         self,
@@ -262,6 +292,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             # expert_alignment rounds the number of tokens per expert
             # to this value.
             expert_alignment=1,
+            num_worst_tokens=self._fixed_capacity_num_worst_tokens(tokens),
             config=self._get_dispatch_config(),
             previous_event=previous_event,
             async_finish=self.async_prepare and not dbo_enabled(),
@@ -309,6 +340,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x, expert_x_scale = token_data, None
 
         assert expert_topk_ids is not None
+        fixed_capacity_dispatch = len(expert_num_tokens_per_expert_list) == 0
         use_direct_assignment = self._preserve_raw_local_ids
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or use_direct_assignment
@@ -353,10 +385,14 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 else mk.ExpertAssignmentLayout.Generic
             )
         )
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            expert_num_tokens_per_expert_list,
-            device=expert_x.device,
-            assignment_layout=assignment_layout,
+        expert_tokens_meta = (
+            None
+            if fixed_capacity_dispatch
+            else mk.ExpertTokensMetadata.make_from_list(
+                expert_num_tokens_per_expert_list,
+                device=expert_x.device,
+                assignment_layout=assignment_layout,
+            )
         )
 
         # * For non-block quant, dispatch in b16 and quantize now as

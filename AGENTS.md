@@ -159,10 +159,19 @@ Run the following experiments in order:
      `final_both_64 = ignore-invalid ON + W1/W2 BLOCK_M=64`.
      Final improved original by about `-12.9%` at tokens 320 and `-10.5%`
      at tokens 448. Filtering alone accounted for about `-2.6%` and `-3.3%`.
-   - Next find the M64/M128 crossover with only `default` vs `final_both_64`
-     over tokens `256,320,384,448,512,640,768,1024`, 3 seeds, and 3 balanced
-     cycles. After locating the boundary, rerun only boundary tokens with
-     5 seeds and 4 cycles.
+   - Added a fixed-capacity DeepEP HT prototype gated behind
+     `VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH=1`. It uses DeepEP
+     `num_worst_tokens`, skips CPU count-list metadata creation, and requires
+     generic `ignore-invalid` handling. Correctness smoke passed for tokens
+     320/448.
+   - Fixed-capacity vs `final_both_64` paired result:
+     tokens 320 improved about `-4.0%` with `10/12` wins, and tokens 448
+     improved about `-4.5%` with `12/12` wins.
+   - Next fixed-capacity follow-up: remove the remaining `-1 -> global invalid`
+     remap by teaching generic alignment to skip raw `-1`, then run
+     async/DBO/comm-SM sweeps.
+   - Keep M64/M128 crossover on the queue, but fixed-capacity now has enough
+     signal to take priority.
    - Runner examples:
      `python benchmarks/results/run_deepep_ht_paired_matrix.py --mode block-m-screening`
      and

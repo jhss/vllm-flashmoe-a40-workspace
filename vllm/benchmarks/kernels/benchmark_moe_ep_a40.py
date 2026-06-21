@@ -712,6 +712,7 @@ def _wrap_deepep_ht_receiver_details(
                 deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
                 or use_direct_assignment
             )
+            fixed_capacity_dispatch = len(expert_num_tokens_per_expert_list) == 0
             if not use_direct_assignment and use_local_expert_ids:
                 local_num_experts = len(expert_num_tokens_per_expert_list)
                 expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
@@ -739,10 +740,14 @@ def _wrap_deepep_ht_receiver_details(
                     else mk_module.ExpertAssignmentLayout.Generic
                 )
             )
-            expert_tokens_meta = mk_module.ExpertTokensMetadata.make_from_list(
-                expert_num_tokens_per_expert_list,
-                device=expert_x.device,
-                assignment_layout=assignment_layout,
+            expert_tokens_meta = (
+                None
+                if fixed_capacity_dispatch
+                else mk_module.ExpertTokensMetadata.make_from_list(
+                    expert_num_tokens_per_expert_list,
+                    device=expert_x.device,
+                    assignment_layout=assignment_layout,
+                )
             )
 
         if not quant_config.is_block_quantized and not defer_input_quant:

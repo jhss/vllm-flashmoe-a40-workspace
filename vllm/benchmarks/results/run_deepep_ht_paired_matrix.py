@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Block-M sweep settings. Supported values: default, w1_32, "
             "w1_64, w1_128, w2_32, w2_64, w2_128, both_32, both_64, "
-            "both_128."
+            "both_128, fixed_both_64."
         ),
     )
     parser.add_argument("--section-profile-iters", type=int, default=0)
@@ -130,6 +130,8 @@ def common_env(args: argparse.Namespace) -> dict[str, str]:
         {
             "NCCL_P2P_DISABLE": args.nccl_p2p_disable,
             "VLLM_DEEPEP_HT_NUM_SMS": str(args.deepep_ht_num_sms),
+            "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH": "0",
+            "VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS": "0",
             "VLLM_MOE_TRITON_EP_MASKED_ACTIVATION": "0",
             "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": "0",
             "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": "0",
@@ -179,11 +181,15 @@ def parse_block_setting(name: str) -> tuple[int | None, int | None]:
 def block_m_settings(names: list[str]) -> list[Setting]:
     settings = []
     for name in names:
-        w1_block_m, w2_block_m = parse_block_setting(name)
+        fixed_capacity = name.startswith("fixed_")
+        parsed_name = name.removeprefix("fixed_") if fixed_capacity else name
+        w1_block_m, w2_block_m = parse_block_setting(parsed_name)
         env = {
             "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "1",
             "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
         }
+        if fixed_capacity:
+            env["VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH"] = "1"
         if w1_block_m is not None:
             env["VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE"] = str(w1_block_m)
         if w2_block_m is not None:

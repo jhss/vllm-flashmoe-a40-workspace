@@ -254,6 +254,8 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS: bool = False
     VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT: bool = False
     VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG: bool = False
+    VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH: bool = False
+    VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS: int = 0
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
@@ -1800,6 +1802,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable extra validation for the DeepEP HT direct assignment scheduler.
     "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG", "0"))
+    ),
+    # Use DeepEP intranode dispatch with num_worst_tokens to avoid the
+    # receive-count CPU sync. Experimental; requires generic ignore-invalid
+    # handling so padded top-k rows (-1) are filtered downstream.
+    "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH", "0"))
+    ),
+    "VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS", "0")
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput

@@ -31,6 +31,7 @@ SETTING_ORDER = (
     "block_w2_128",
     "block_both_32",
     "block_both_64",
+    "block_fixed_both_64",
     "block_both_128",
 )
 INT_FIELDS = {

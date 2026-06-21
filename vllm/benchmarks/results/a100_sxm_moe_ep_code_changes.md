@@ -3148,3 +3148,132 @@ tokens  median delta  pair pct  wins
 탐색이다. 우선 `default` vs `final_both_64`만 비교해 token range
 `256,320,384,448,512,640,768,1024`에서 상한을 찾고, 경계 주변만 5 seeds
 × 4 cycles로 재검증한다.
+
+## 23. DeepEP HT fixed-capacity dispatch prototype
+
+Section 22 이후에는 compute padding이 줄어든 최종 설정에서 DeepEP HT prepare
+orchestration이 얼마나 남는지 다시 봤다. `nsys`는 현재 환경에 없고 `ncu`만
+있어서, 기존 section profiler로 먼저 재측정했다.
+
+Final setting profile:
+
+```text
+benchmarks/results/deepep_ht_final_both64_profile_20260621_raw.csv
+benchmarks/results/deepep_ht_final_both64_profile_20260621/
+```
+
+`final_both_64`의 대표 section 평균:
+
+```text
+tokens  rank  prepare  dispatch_submit  receiver  topk_remap  metadata  experts  finalize  combine_copy
+320     0     411.9us  169.0us          205.6us   95.1us      43.8us    772.6us  195.1us   29.6us
+320     1     402.5us  154.4us          209.9us   96.5us      45.5us    782.6us  179.8us   29.7us
+448     0     398.5us  158.0us          204.5us   93.3us      43.5us    805.4us  186.2us   31.2us
+448     1     400.5us  160.3us          204.5us   93.9us      43.3us    800.9us  193.2us   31.2us
+```
+
+M64로 expert compute를 줄인 뒤에도 prepare는 약 400us 남고, receiver remap
+plus metadata가 약 137-142us다. combine receiver copy도 약 30us 남는다. 즉
+다음 최적화 축은 통신량 압축보다 CPU-sync/metadata/remap/copy 제거가 맞다.
+
+Prototype:
+
+```text
+VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH=1
+VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS=0
+```
+
+이 flag는 DeepEP intranode dispatch에 `num_worst_tokens`를 넘긴다. 기본값
+0은 `local_input_tokens * dp_size`를 worst capacity로 쓴다. DeepEP는 실제
+receive row 뒤를 `topk_id=-1`로 채우고 per-expert count list를 비워
+반환한다. vLLM 쪽은 이 경우 `ExpertTokensMetadata.make_from_list()`를
+생략하고 generic ignore-invalid assignment로 넘긴다.
+
+현재 prototype은 의도적으로 좁게 gated 되어 있다.
+
+```text
+requires:
+  DeepEP HT intranode
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1
+  generic global expert IDs
+
+rejects:
+  internode
+  VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1
+  VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=1
+```
+
+Correctness:
+
+```text
+benchmarks/results/verify_deepep_ht_block_m_correctness.py
+benchmarks/results/deepep_ht_block_m_correctness_tokens320_20260621.json
+benchmarks/results/deepep_ht_block_m_correctness_tokens448_20260621.json
+```
+
+`fixed_both_64`도 `block_default` reference와 비교해 rank0/rank1 모두
+`max_abs=0`, `mean_abs=0`, `relative_l2=0`, `assert_close=true`였다.
+
+Paired performance:
+
+```text
+benchmarks/results/deepep_ht_fixed_capacity_vs_final_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_fixed_capacity_vs_final_20260621_3seed_commands.log
+benchmarks/results/deepep_ht_fixed_capacity_vs_final_20260621_3seed_summary.md
+```
+
+Run shape:
+
+```text
+tokens:       320, 448
+settings:     block_both_64, block_fixed_both_64
+input seeds:  1007, 2007, 3007
+cycles:       4 balanced cycles
+warmup/iters: 20 / 100
+rows:         48 measurements, 24 paired comparisons
+```
+
+Paired critical-path delta, `block_fixed_both_64 - block_both_64`:
+
+```text
+tokens  recv-M median  median delta  pair pct  wins
+320     640            -57.9 us      -3.98%    10/12
+448     896            -67.0 us      -4.45%    12/12
+```
+
+320에는 one-off positive outlier가 있었지만 seed-level median은 세 seed 모두
+음수였다. 448은 12/12 wins다.
+
+Fixed-capacity section profile:
+
+```text
+benchmarks/results/deepep_ht_fixed_capacity_profile_20260621_raw.csv
+benchmarks/results/deepep_ht_fixed_capacity_profile_20260621/
+```
+
+Representative section deltas:
+
+```text
+tokens  setting              prepare  receiver  topk_remap  metadata  experts  combine_copy
+320     block_both_64        ~590us   ~321us    ~144us      ~70us     ~938us   ~48us
+320     block_fixed_both_64  ~361us   ~160us    ~89us       ~6us      ~761us   ~30us
+448     block_both_64        ~424us   ~204us    ~91us       ~44us     ~816us   ~30us
+448     block_fixed_both_64  ~370us   ~161us    ~87us       ~6us      ~794us   ~32us
+```
+
+Section profiling perturbs absolute timings, but the direction is clear:
+metadata creation almost disappears, receiver time drops, and full forward
+improves by about 4% on the paired run. This validates fixed-capacity as the
+next communication-side project.
+
+Next steps:
+
+```text
+1. Replace the remaining -1 -> global invalid remap with raw -1 skip in generic
+   alignment, so fixed-capacity can remove topk_remap as well as metadata.
+2. Add an async/DBO sweep:
+   settings = final_both_64, fixed_both_64, fixed_both_64 + DBO
+   comm SMs = 8,12,16,20,24
+3. Track route stats for fixed-capacity mode without CPU count list, likely by
+   counting valid top-k rows on GPU or deriving from assignment stats.
+```

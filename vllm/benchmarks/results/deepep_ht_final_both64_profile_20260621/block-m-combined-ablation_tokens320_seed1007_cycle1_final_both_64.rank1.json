@@ -1,0 +1,86 @@
+{
+  "backend": "deepep_high_throughput",
+  "hidden_size": 2048,
+  "intermediate_size": 768,
+  "iters": 20,
+  "num_experts": 128,
+  "rank": 1,
+  "sections": {
+    "deepep_combine_receiver_copy": {
+      "avg_ms": 0.029707420617341995,
+      "count": 20,
+      "max_ms": 0.03227405250072479,
+      "min_ms": 0.02833828330039978
+    },
+    "deepep_combine_submit": {
+      "avg_ms": 0.11626929044723511,
+      "count": 20,
+      "max_ms": 0.17159059643745422,
+      "min_ms": 0.09796395897865295
+    },
+    "deepep_dispatch_receiver": {
+      "avg_ms": 0.20991526544094086,
+      "count": 20,
+      "max_ms": 0.235656276345253,
+      "min_ms": 0.19561313092708588
+    },
+    "deepep_dispatch_submit": {
+      "avg_ms": 0.15439726412296295,
+      "count": 20,
+      "max_ms": 0.1798085868358612,
+      "min_ms": 0.14289654791355133
+    },
+    "deepep_receiver_metadata": {
+      "avg_ms": 0.045528821647167206,
+      "count": 20,
+      "max_ms": 0.05974434316158295,
+      "min_ms": 0.041937455534935
+    },
+    "deepep_receiver_post_quant": {
+      "avg_ms": 0.009091757237911224,
+      "count": 20,
+      "max_ms": 0.010360032320022583,
+      "min_ms": 0.008344650268554688
+    },
+    "deepep_receiver_topk_remap": {
+      "avg_ms": 0.09648734703660011,
+      "count": 20,
+      "max_ms": 0.11242926120758057,
+      "min_ms": 0.08968450129032135
+    },
+    "deepep_receiver_unpack": {
+      "avg_ms": 0.005235802382230759,
+      "count": 20,
+      "max_ms": 0.006105750799179077,
+      "min_ms": 0.00492483377456665
+    },
+    "deepep_receiver_wait": {
+      "avg_ms": 0.007610302418470383,
+      "count": 20,
+      "max_ms": 0.008963048458099365,
+      "min_ms": 0.006996095180511475
+    },
+    "moe_experts_total": {
+      "avg_ms": 0.7825656794011593,
+      "count": 20,
+      "max_ms": 0.8318144828081131,
+      "min_ms": 0.7487516850233078
+    },
+    "moe_finalize_total": {
+      "avg_ms": 0.17982618883252144,
+      "count": 20,
+      "max_ms": 0.23331865668296814,
+      "min_ms": 0.15821494162082672
+    },
+    "moe_prepare_total": {
+      "avg_ms": 0.40254537016153336,
+      "count": 20,
+      "max_ms": 0.45581720769405365,
+      "min_ms": 0.3753155469894409
+    }
+  },
+  "tokens": 320,
+  "top_k": 8,
+  "warmup": 5,
+  "world_size": 2
+}

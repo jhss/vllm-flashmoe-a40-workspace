@@ -45,6 +45,7 @@ class CorrectnessSetting:
     name: str
     w1_block_m: int
     w2_block_m: int
+    fixed_capacity: bool = False
 
 
 @dataclass
@@ -66,6 +67,7 @@ SETTINGS = (
     CorrectnessSetting("block_default", 0, 0),
     CorrectnessSetting("block_both_64", 64, 64),
     CorrectnessSetting("block_both_32", 32, 32),
+    CorrectnessSetting("fixed_both_64", 64, 64, fixed_capacity=True),
 )
 
 
@@ -126,6 +128,8 @@ def configure_common_env(args: argparse.Namespace) -> None:
     os.environ["VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG"] = "0"
     os.environ["VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS"] = "0"
     os.environ["VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT"] = "0"
+    os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH"] = "0"
+    os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS"] = "0"
 
 
 def clear_env_cache() -> None:
@@ -138,6 +142,9 @@ def clear_env_cache() -> None:
 def configure_setting(setting: CorrectnessSetting) -> None:
     os.environ["VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE"] = str(setting.w1_block_m)
     os.environ["VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE"] = str(setting.w2_block_m)
+    os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH"] = (
+        "1" if setting.fixed_capacity else "0"
+    )
     clear_env_cache()
 
 
@@ -261,6 +268,7 @@ def run_worker(
                     "setting": setting.name,
                     "w1_block_m": setting.w1_block_m,
                     "w2_block_m": setting.w2_block_m,
+                    "fixed_capacity": setting.fixed_capacity,
                     "local_stats": stats_by_rank[rank],
                 }
             )
