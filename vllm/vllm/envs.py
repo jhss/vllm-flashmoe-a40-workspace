@@ -255,6 +255,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT: bool = False
     VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG: bool = False
     VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH: bool = False
+    VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS: bool = True
     VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS: int = 0
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
@@ -1808,6 +1809,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and padded rows (-1) for downstream alignment to filter directly.
     "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH", "0"))
+    ),
+    # Keep DeepEP HT fixed-capacity top-k ids as receiver-local ids with raw
+    # -1 invalid rows. Set to 0 only for fixed-remap A/B benchmarking.
+    "VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS", "1"))
     ),
     "VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS": lambda: int(
         os.getenv("VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS", "0")

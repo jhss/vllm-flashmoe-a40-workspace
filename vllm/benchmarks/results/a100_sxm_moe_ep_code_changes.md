@@ -3400,3 +3400,104 @@ The fixed remap section now measures only the Python section wrapper and
 assert/pass overhead. The remaining fixed-capacity work is mostly dispatch
 wait/unpack/post-quant and expert compute; the explicit top-k remap kernel is
 no longer on the receiver path.
+
+## 26. Fixed-capacity remap vs raw-negative A/B
+
+Section 25's `-10.11%` smoke compared `block_both_64` against
+`block_fixed_both_64` after raw-negative alignment, so it mixed two effects:
+
+```text
+dynamic receive -> fixed-capacity receive
+fixed-capacity remap -> fixed-capacity raw local id / -1
+```
+
+To isolate the second effect, fixed-capacity now has an A/B-only toggle:
+
+```text
+VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS=1  # default raw path
+VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS=0  # old remap path
+```
+
+The benchmark wrapper accepts:
+
+```text
+fixed_raw_both_64
+fixed_remap_both_64
+```
+
+so both modes can be compared in the same binary without checking out and
+rebuilding `df1bb4b`.
+
+Run:
+
+```text
+benchmarks/results/deepep_ht_fixed_commands_vs_remap_20260621_3seed_commands.log
+benchmarks/results/deepep_ht_fixed_raw_vs_remap_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_fixed_raw_vs_remap_20260621_3seed_summary.md
+```
+
+Shape:
+
+```text
+tokens:       320, 448
+settings:     block_fixed_raw_both_64, block_fixed_remap_both_64
+input seeds:  1007, 2007, 3007
+cycles:       4 balanced cycles
+warmup/iters: 20 / 100
+rows:         48 measurements, 24 paired comparisons
+```
+
+The analyzer uses `block_fixed_raw_both_64` as baseline. Therefore positive
+delta means the old remap path is slower, and the raw-negative contribution is
+the inverse.
+
+```text
+tokens  raw median  remap median  remap delta  raw contribution  remap wins
+320     1458.9 us   1535.1 us     +88.3 us     -6.05%            1/12
+448     1508.2 us   1583.6 us     +65.7 us     -4.36%            1/12
+```
+
+Seed-level medians were also consistently in favor of raw-negative:
+
+```text
+tokens  seed  remap - raw median
+320     1007  +149.2 us
+320     2007  +70.1 us
+320     3007  +76.0 us
+448     1007  +133.3 us
+448     2007  +52.1 us
+448     3007  +51.5 us
+```
+
+This means the raw-negative alignment change independently contributes roughly
+4-6% on top of fixed-capacity for this EP=2, top-k=8 setup. The cumulative
+10% smoke from Section 25 should be read as fixed-capacity plus raw-negative,
+not raw-negative alone.
+
+Regression coverage:
+
+```text
+tests/kernels/moe/test_moe_align_block_size.py -k raw_invalid
+```
+
+The new test covers:
+
+```text
+small alignment path
+large alignment by numel
+large alignment by expert count
+topk_ids int32 / int64
+expert_map present / absent
+ignore_invalid_experts true / false
+mixed raw invalid ids
+all-invalid inputs
+```
+
+Result:
+
+```text
+48 passed, 429 deselected
+```
+
+The paired analyzer also now prints `n/a` for route stats when fixed-capacity
+intentionally omits CPU route-pair counts, instead of failing on `None`.

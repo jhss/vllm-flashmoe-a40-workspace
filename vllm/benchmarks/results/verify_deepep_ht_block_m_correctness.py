@@ -31,13 +31,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.kernels import benchmark_moe_ep_a40 as bench  # noqa: E402
+from vllm import envs  # noqa: E402
 from vllm.distributed import cleanup_dist_env_and_memory  # noqa: E402
 from vllm.v1.worker.workspace import (  # noqa: E402
     init_workspace_manager,
     is_workspace_manager_initialized,
 )
-
-from vllm import envs  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -146,6 +145,7 @@ def configure_common_env(args: argparse.Namespace) -> None:
     os.environ["VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS"] = "0"
     os.environ["VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT"] = "0"
     os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH"] = "0"
+    os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS"] = "1"
     os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS"] = "0"
 
 

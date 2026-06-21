@@ -288,6 +288,148 @@ def test_moe_align_block_size_with_expert_map(
     )
 
 
+def _make_invalid_topk_ids(
+    m: int,
+    topk: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    all_invalid: bool,
+) -> torch.Tensor:
+    topk_ids = (
+        torch.arange(m * topk, device="cuda", dtype=torch.int64)
+        .remainder(num_experts)
+        .view(m, topk)
+    )
+    if all_invalid:
+        topk_ids.fill_(-1)
+        topk_ids.view(-1)[1::3] = num_experts
+        topk_ids.view(-1)[2::3] = num_experts + 7
+    else:
+        flat = topk_ids.view(-1)
+        flat[0::11] = -1
+        flat[3::17] = -2
+        flat[5::19] = num_experts
+        flat[7::23] = num_experts + 7
+    return topk_ids.to(dtype=dtype)
+
+
+def _make_even_expert_map(num_experts: int) -> torch.Tensor:
+    expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
+    for local_id, expert_id in enumerate(range(0, num_experts, 2)):
+        expert_map[expert_id] = local_id
+    return expert_map
+
+
+def _expected_invalid_align_groups(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    expert_map: torch.Tensor | None,
+    ignore_invalid_experts: bool,
+) -> tuple[dict[int, list[int]], int]:
+    topk_cpu = topk_ids.cpu().view(-1)
+    expert_map_cpu = expert_map.cpu() if expert_map is not None else None
+    groups: dict[int, list[int]] = {}
+    schedule_counts: dict[int, int] = {}
+
+    for route_idx, raw_expert_id_tensor in enumerate(topk_cpu):
+        raw_expert_id = int(raw_expert_id_tensor.item())
+        if raw_expert_id < 0 or raw_expert_id >= num_experts:
+            continue
+
+        mapped_expert_id = raw_expert_id
+        if expert_map_cpu is not None:
+            mapped_expert_id = int(expert_map_cpu[raw_expert_id].item())
+            if ignore_invalid_experts and mapped_expert_id < 0:
+                continue
+
+        groups.setdefault(mapped_expert_id, []).append(route_idx)
+        schedule_expert_id = (
+            mapped_expert_id
+            if expert_map_cpu is not None and ignore_invalid_experts
+            else raw_expert_id
+        )
+        schedule_counts[schedule_expert_id] = (
+            schedule_counts.get(schedule_expert_id, 0) + 1
+        )
+
+    expected_post_pad = sum(
+        cdiv(count, block_size) * block_size for count in schedule_counts.values()
+    )
+    return groups, expected_post_pad
+
+
+@pytest.mark.parametrize(
+    ("m", "topk", "num_experts", "block_size"),
+    [
+        pytest.param(8, 4, 8, 4, id="small"),
+        pytest.param(300, 4, 8, 16, id="large-numel"),
+        pytest.param(8, 4, 80, 8, id="large-experts"),
+    ],
+)
+@pytest.mark.parametrize("topk_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    ("use_expert_map", "ignore_invalid_experts"),
+    [
+        pytest.param(False, False, id="no-map-keep"),
+        pytest.param(False, True, id="no-map-ignore"),
+        pytest.param(True, False, id="map-keep"),
+        pytest.param(True, True, id="map-ignore"),
+    ],
+)
+@pytest.mark.parametrize("all_invalid", [False, True])
+def test_moe_align_block_size_skips_raw_invalid_ids(
+    m: int,
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    topk_dtype: torch.dtype,
+    use_expert_map: bool,
+    ignore_invalid_experts: bool,
+    all_invalid: bool,
+):
+    topk_ids = _make_invalid_topk_ids(
+        m, topk, num_experts, topk_dtype, all_invalid=all_invalid
+    )
+    expert_map = _make_even_expert_map(num_experts) if use_expert_map else None
+
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+        expert_map=expert_map,
+        ignore_invalid_experts=ignore_invalid_experts,
+    )
+
+    expected_groups, expected_post_pad = _expected_invalid_align_groups(
+        topk_ids,
+        num_experts,
+        block_size,
+        expert_map,
+        ignore_invalid_experts,
+    )
+    actual_post_pad = int(num_tokens_post_pad.item())
+    assert actual_post_pad == expected_post_pad
+
+    actual_groups = _group_tokens_by_expert(
+        sorted_ids,
+        expert_ids,
+        block_size,
+        actual_post_pad,
+        topk_ids.numel(),
+    )
+    assert set(actual_groups) == set(expected_groups)
+    for expert_id, expected_route_indices in expected_groups.items():
+        assert sorted(actual_groups[expert_id]) == sorted(expected_route_indices)
+
+    valid_scheduled = sorted_ids[:actual_post_pad]
+    valid_scheduled = valid_scheduled[valid_scheduled < topk_ids.numel()]
+    assert valid_scheduled.numel() == sum(
+        len(route_indices) for route_indices in expected_groups.values()
+    )
+
+
 def test_moe_align_block_size_deterministic():
     m, topk, num_experts, block_size = 128, 2, 32, 64
 

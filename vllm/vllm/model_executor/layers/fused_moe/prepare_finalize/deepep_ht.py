@@ -240,7 +240,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         expert_map: torch.Tensor | None,
         device: torch.device,
     ) -> tuple[int, torch.Tensor | None]:
-        if envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH:
+        if (
+            envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH
+            and envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS
+        ):
             return (
                 local_num_experts,
                 self._get_local_expert_map(device, local_num_experts),
@@ -464,9 +467,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or use_direct_assignment
         )
-        # Fixed-capacity and direct assignment both preserve DeepEP HT's raw
-        # local IDs. Alignment skips -1 padded rows directly.
-        if not fixed_capacity_dispatch:
+        use_fixed_capacity_raw_ids = (
+            fixed_capacity_dispatch and envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS
+        )
+        # Fixed-capacity raw-ID mode and direct assignment both preserve DeepEP
+        # HT's raw local IDs. Alignment skips -1 padded rows directly.
+        if not use_fixed_capacity_raw_ids:
             if not use_direct_assignment and use_local_expert_ids:
                 local_num_experts = len(expert_num_tokens_per_expert_list)
                 expert_topk_ids = remap_deepep_ht_topk_ids(

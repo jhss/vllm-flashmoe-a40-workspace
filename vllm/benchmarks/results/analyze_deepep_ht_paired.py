@@ -422,6 +422,16 @@ def print_ignore_table(rows: list[dict[str, Any]]) -> None:
 
 
 def print_route_table(rows: list[dict[str, Any]]) -> None:
+    def format_pair_median(
+        left_values: list[float | None],
+        right_values: list[float | None],
+    ) -> str:
+        left = [value for value in left_values if value is not None]
+        right = [value for value in right_values if value is not None]
+        if not left or not right:
+            return "n/a"
+        return f"{median(left):.0f}/{median(right):.0f}"
+
     baseline = baseline_setting(rows)
     group_cols = group_columns(rows)
     print("## Route Stats")
@@ -440,8 +450,8 @@ def print_route_table(rows: list[dict[str, Any]]) -> None:
         cells = [str(value) for value in group_key]
         cells.extend(
             [
-                f"{median(valid0):.0f}/{median(valid1):.0f}",
-                f"{median(invalid0):.0f}/{median(invalid1):.0f}",
+                format_pair_median(valid0, valid1),
+                format_pair_median(invalid0, invalid1),
             ]
         )
         print("| " + " | ".join(cells) + " |")

@@ -759,7 +759,11 @@ def _wrap_deepep_ht_receiver_details(
                 deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
                 or use_direct_assignment
             )
-            if not fixed_capacity_dispatch:
+            use_fixed_capacity_raw_ids = (
+                fixed_capacity_dispatch
+                and deepep_ht_module.envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS
+            )
+            if not use_fixed_capacity_raw_ids:
                 if not use_direct_assignment and use_local_expert_ids:
                     local_num_experts = len(expert_num_tokens_per_expert_list)
                     expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
