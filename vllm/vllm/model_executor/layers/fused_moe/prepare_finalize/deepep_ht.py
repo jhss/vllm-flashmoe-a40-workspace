@@ -7,6 +7,7 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -107,6 +108,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.async_prepare = True
         self._local_expert_maps: dict[tuple[torch.device, int], torch.Tensor] = {}
         self._preserve_raw_local_ids = False
+        self._fixed_capacity_supported = False
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -117,8 +119,69 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
-        if not envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT:
-            return
+        self._fixed_capacity_supported = self._supports_fixed_capacity_experts(
+            fused_experts
+        )
+        if envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH:
+            self._validate_fixed_capacity_experts(fused_experts)
+
+        if envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT:
+            self._validate_direct_assignment_experts(fused_experts)
+            self._preserve_raw_local_ids = True
+
+    def _supports_fixed_capacity_experts(
+        self, fused_experts: mk.FusedMoEExperts
+    ) -> bool:
+        quant_config = fused_experts.quant_config
+        return (
+            fused_experts.supports_deepep_ht_fixed_capacity()
+            and not fused_experts.moe_config.is_lora_enabled
+            and fused_experts.moe_config.in_dtype == torch.bfloat16
+            and quant_config.quant_dtype is None
+            and quant_config.weight_quant_dtype is None
+        )
+
+    def _validate_fixed_capacity_experts(
+        self, fused_experts: mk.FusedMoEExperts
+    ) -> None:
+        quant_config = fused_experts.quant_config
+        if envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH does not support "
+                "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT."
+            )
+        if envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH does not support "
+                "VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS."
+            )
+        if not fused_experts.supports_deepep_ht_fixed_capacity():
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires an "
+                "experts backend that supports fixed-size DeepEP HT "
+                "receive buffers."
+            )
+        if fused_experts.moe_config.is_lora_enabled:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH does not support LoRA."
+            )
+        if fused_experts.moe_config.in_dtype != torch.bfloat16:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH currently "
+                "requires BF16 activations."
+            )
+        if (
+            quant_config.quant_dtype is not None
+            or quant_config.weight_quant_dtype is not None
+        ):
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH does not support "
+                "quantized expert kernels."
+            )
+
+    def _validate_direct_assignment_experts(
+        self, fused_experts: mk.FusedMoEExperts
+    ) -> None:
         if not fused_experts.supports_deepep_ht_raw_local_ids():
             raise ValueError(
                 "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT requires an experts "
@@ -137,7 +200,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT does not support "
                 "quantized expert kernels."
             )
-        self._preserve_raw_local_ids = True
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -206,6 +268,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires intranode "
                 "DeepEP HT dispatch."
             )
+        if not self._fixed_capacity_supported:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires a supported "
+                "Triton BF16 unquantized expert backend without LoRA."
+            )
         if (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
             or envs.VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT
@@ -220,13 +287,38 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1 so padded "
                 "top-k rows are filtered downstream."
             )
+        if tokens.dtype != torch.bfloat16:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH currently requires "
+                f"BF16 dispatch tensors, got {tokens.dtype}."
+            )
         num_worst_tokens = envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS
         if num_worst_tokens <= 0:
-            num_worst_tokens = tokens.size(0) * self.dp_size
-        if num_worst_tokens < tokens.size(0):
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires an explicit "
+                "positive VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS. "
+                "Use max_tokens_per_dp_rank * dp_size for static buckets."
+            )
+
+        required_tokens = tokens.size(0)
+        if self.dp_size > 1:
+            if not is_forward_context_available():
+                raise ValueError(
+                    "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires forward "
+                    "context DP metadata to validate receive capacity."
+                )
+            dp_metadata = get_forward_context().dp_metadata
+            if dp_metadata is None:
+                raise ValueError(
+                    "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires DP "
+                    "metadata to validate receive capacity."
+                )
+            required_tokens = int(dp_metadata.num_tokens_across_dp_cpu.sum().item())
+
+        if num_worst_tokens < required_tokens:
             raise ValueError(
                 "VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS must be at "
-                f"least the local token count ({tokens.size(0)}), got "
+                f"least the DP token upper bound ({required_tokens}), got "
                 f"{num_worst_tokens}."
             )
         return num_worst_tokens
@@ -273,6 +365,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
+        num_worst_tokens = self._fixed_capacity_num_worst_tokens(tokens)
         (
             token_data,
             expert_topk_ids,
@@ -292,7 +385,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             # expert_alignment rounds the number of tokens per expert
             # to this value.
             expert_alignment=1,
-            num_worst_tokens=self._fixed_capacity_num_worst_tokens(tokens),
+            num_worst_tokens=num_worst_tokens,
             config=self._get_dispatch_config(),
             previous_event=previous_event,
             async_finish=self.async_prepare and not dbo_enabled(),
@@ -316,6 +409,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             a1_scale,
             quant_config,
             defer_input_quant=defer_input_quant,
+            fixed_capacity_dispatch=num_worst_tokens > 0,
         )
 
     def _receiver(
@@ -330,6 +424,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
+        fixed_capacity_dispatch: bool,
     ) -> mk.PrepareResultType:
         if event.event is not None:
             event.current_stream_wait()
@@ -340,7 +435,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_x, expert_x_scale = token_data, None
 
         assert expert_topk_ids is not None
-        fixed_capacity_dispatch = len(expert_num_tokens_per_expert_list) == 0
         use_direct_assignment = self._preserve_raw_local_ids
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or use_direct_assignment

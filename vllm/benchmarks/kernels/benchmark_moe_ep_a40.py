@@ -84,6 +84,8 @@ class BenchResult:
     input_seed_rank0: int | None
     input_seed_rank1: int | None
     input_tokens: int
+    input_tokens_rank0: int
+    input_tokens_rank1: int | None
     received_tokens_rank0: int | None
     received_tokens_rank1: int | None
     ep_ignore_enabled_rank0: bool | None
@@ -111,6 +113,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=1, choices=[1, 2])
     parser.add_argument("--backend", default="allgather_reducescatter")
     parser.add_argument("--tokens", type=int, default=256)
+    parser.add_argument(
+        "--rank-tokens",
+        type=int,
+        nargs="+",
+        help=(
+            "Optional per-rank input token counts. The number of values must "
+            "match --world-size. This is intended for DP imbalance tests."
+        ),
+    )
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--intermediate-size", type=int, default=768)
     parser.add_argument("--num-experts", type=int, default=128)
@@ -174,7 +185,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also export a Chrome trace next to the JSON summary.",
     )
+    parser.add_argument(
+        "--route-target-rank",
+        type=int,
+        default=-1,
+        help=(
+            "If non-negative, force router logits to select experts owned by "
+            "this DP/EP rank. This stresses receive-capacity bounds."
+        ),
+    )
     return parser.parse_args()
+
+
+def tokens_for_rank(args: argparse.Namespace, rank: int) -> int:
+    if args.rank_tokens is None:
+        return args.tokens
+    return args.rank_tokens[rank]
+
+
+def tokens_across_dp(args: argparse.Namespace) -> list[int]:
+    if args.rank_tokens is None:
+        return [args.tokens for _ in range(args.world_size)]
+    return list(args.rank_tokens)
 
 
 def make_vllm_config(args: argparse.Namespace) -> VllmConfig:
@@ -187,13 +219,13 @@ def make_vllm_config(args: argparse.Namespace) -> VllmConfig:
     )
     compilation_config = CompilationConfig()
     compilation_config.pass_config.fuse_allreduce_rms = False
-    max_tokens = max(1, next_power_of_2(args.tokens))
+    max_tokens = max(1, next_power_of_2(max(tokens_across_dp(args))))
     return VllmConfig(
         parallel_config=parallel_config,
         compilation_config=compilation_config,
         scheduler_config=SchedulerConfig.default_factory(
             max_num_batched_tokens=max_tokens,
-            max_num_seqs=min(max_tokens, max(1, args.tokens)),
+            max_num_seqs=min(max_tokens, max(1, max(tokens_across_dp(args)))),
         ),
     )
 
@@ -296,12 +328,23 @@ def make_layer_and_inputs(
     if input_seed is not None:
         set_random_seed(input_seed)
 
+    local_tokens = tokens_for_rank(args, rank)
     hidden_states = (
-        torch.randn(args.tokens, args.hidden_size, device=device, dtype=dtype) / 10
+        torch.randn(local_tokens, args.hidden_size, device=device, dtype=dtype) / 10
     )
     router_logits = torch.randn(
-        args.tokens, args.num_experts, device=device, dtype=dtype
+        local_tokens, args.num_experts, device=device, dtype=dtype
     )
+    if args.route_target_rank >= 0:
+        if args.route_target_rank >= args.world_size:
+            raise ValueError("--route-target-rank must be less than --world-size")
+        local_num_experts = args.num_experts // args.world_size
+        start = args.route_target_rank * local_num_experts
+        end = start + local_num_experts
+        router_logits.fill_(-1000)
+        router_logits[:, start:end] = torch.randn(
+            local_tokens, local_num_experts, device=device, dtype=dtype
+        )
     return layer, hidden_states, router_logits
 
 
@@ -311,13 +354,15 @@ def make_forward_context(
     vllm_config: VllmConfig,
     device: torch.device,
 ):
-    num_tokens_across_dp = torch.full(
-        (args.world_size,), args.tokens, dtype=torch.int, device=device
+    local_rank = device.index or 0
+    local_tokens = tokens_for_rank(args, local_rank)
+    num_tokens_across_dp = torch.tensor(
+        tokens_across_dp(args), dtype=torch.int, device=device
     )
     with set_forward_context(
         None,
         vllm_config,
-        num_tokens=args.tokens,
+        num_tokens=local_tokens,
         num_tokens_across_dp=num_tokens_across_dp,
     ):
         ctx = get_forward_context()
@@ -678,6 +723,7 @@ def _wrap_deepep_ht_receiver_details(
         a1_scale: torch.Tensor | None,
         quant_config,
         defer_input_quant: bool,
+        fixed_capacity_dispatch: bool,
     ):
         profiler = _SECTION_PROFILER
         if profiler is None:
@@ -693,6 +739,7 @@ def _wrap_deepep_ht_receiver_details(
                 a1_scale,
                 quant_config,
                 defer_input_quant,
+                fixed_capacity_dispatch,
             )
 
         with profiler.section("deepep_receiver_wait"):
@@ -712,7 +759,6 @@ def _wrap_deepep_ht_receiver_details(
                 deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
                 or use_direct_assignment
             )
-            fixed_capacity_dispatch = len(expert_num_tokens_per_expert_list) == 0
             if not use_direct_assignment and use_local_expert_ids:
                 local_num_experts = len(expert_num_tokens_per_expert_list)
                 expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
@@ -1080,7 +1126,11 @@ def run_worker(
             input_seed_rank1=(
                 input_seed_for_rank(args, 1) if args.world_size > 1 else None
             ),
-            input_tokens=args.tokens,
+            input_tokens=tokens_for_rank(args, rank),
+            input_tokens_rank0=tokens_for_rank(args, 0),
+            input_tokens_rank1=(
+                tokens_for_rank(args, 1) if args.world_size > 1 else None
+            ),
             received_tokens_rank0=_rank_stat(ep_stats_by_rank, 0, "received_tokens"),
             received_tokens_rank1=_rank_stat(ep_stats_by_rank, 1, "received_tokens"),
             ep_ignore_enabled_rank0=_rank_stat(
@@ -1134,6 +1184,8 @@ def run_worker(
 
 def main() -> None:
     args = parse_args()
+    if args.rank_tokens is not None and len(args.rank_tokens) != args.world_size:
+        raise ValueError("--rank-tokens must provide one value per rank")
     if args.num_experts % args.world_size != 0:
         raise ValueError("--num-experts must be divisible by --world-size")
     if not torch.cuda.is_available():

@@ -3180,25 +3180,40 @@ Prototype:
 
 ```text
 VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH=1
-VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS=0
+VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS=<explicit capacity>
 ```
 
-이 flag는 DeepEP intranode dispatch에 `num_worst_tokens`를 넘긴다. 기본값
-0은 `local_input_tokens * dp_size`를 worst capacity로 쓴다. DeepEP는 실제
-receive row 뒤를 `topk_id=-1`로 채우고 per-expert count list를 비워
-반환한다. vLLM 쪽은 이 경우 `ExpertTokensMetadata.make_from_list()`를
-생략하고 generic ignore-invalid assignment로 넘긴다.
+이 flag는 DeepEP intranode dispatch에 `num_worst_tokens`를 넘긴다. 이후
+safety patch에서는 `local_input_tokens * dp_size` 자동 계산을 제거했고,
+`VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS > 0`을 필수로 만들었다.
+권장값은 scheduler/static bucket이 알고 있는
+`max_tokens_per_dp_rank * dp_size`다. 실행 시에는 forward context의
+`num_tokens_across_dp_cpu.sum()`과 비교해 capacity가 작으면 dispatch 전에
+명확히 실패한다.
+
+DeepEP는 실제 receive row 뒤를 `topk_id=-1`로 채우고 per-expert count
+list를 비워 반환한다. vLLM 쪽은 dispatch 시점의 `num_worst_tokens > 0`을
+receiver에 명시적으로 넘기고, fixed mode일 때
+`ExpertTokensMetadata.make_from_list()`를 생략한 뒤 generic ignore-invalid
+assignment로 넘긴다. 더 이상 빈 expert-count list 길이로 mode를 추론하지
+않는다.
 
 현재 prototype은 의도적으로 좁게 gated 되어 있다.
 
 ```text
 requires:
   DeepEP HT intranode
+  TritonExperts backend
+  BF16, unquantized experts
+  no LoRA
   VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1
   generic global expert IDs
 
 rejects:
   internode
+  non-Triton expert backends
+  quantized expert kernels
+  LoRA
   VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1
   VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=1
 ```
@@ -3213,6 +3228,26 @@ benchmarks/results/deepep_ht_block_m_correctness_tokens448_20260621.json
 
 `fixed_both_64`도 `block_default` reference와 비교해 rank0/rank1 모두
 `max_abs=0`, `mean_abs=0`, `relative_l2=0`, `assert_close=true`였다.
+
+Safety follow-up correctness:
+
+```text
+benchmarks/results/deepep_ht_fixed_capacity_safety_correctness_tokens320_20260621.json
+benchmarks/results/deepep_ht_fixed_capacity_safety_correctness_rank128_512_20260621.json
+benchmarks/results/deepep_ht_fixed_capacity_safety_correctness_rank512_128_20260621.json
+benchmarks/results/deepep_ht_fixed_capacity_safety_correctness_rank128_512_target0_20260621.json
+benchmarks/results/deepep_ht_fixed_capacity_safety_correctness_rank128_512_target1_20260621.json
+```
+
+Balanced, asymmetric `128/512`, asymmetric `512/128`, and route-target
+concentrated smoke cases all matched `block_default` with zero error. An
+intentional under-capacity run with rank tokens `128/512`, target rank 0, and
+capacity `256` failed before dispatch:
+
+```text
+VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS must be at least the DP token
+upper bound (640), got 256.
+```
 
 Paired performance:
 

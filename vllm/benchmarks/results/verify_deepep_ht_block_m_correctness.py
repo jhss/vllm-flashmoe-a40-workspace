@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=2, choices=[1, 2])
     parser.add_argument("--backend", default="deepep_high_throughput")
     parser.add_argument("--tokens", type=int, default=320)
+    parser.add_argument("--rank-tokens", type=int, nargs="+")
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--intermediate-size", type=int, default=768)
     parser.add_argument("--num-experts", type=int, default=128)
@@ -85,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank-distinct-inputs", action="store_true", default=True)
     parser.add_argument("--deepep-ht-num-sms", type=int, default=24)
     parser.add_argument("--nccl-p2p-disable", default="0")
+    parser.add_argument("--route-target-rank", type=int, default=-1)
+    parser.add_argument("--fixed-capacity-num-worst-tokens", type=int, default=0)
     parser.add_argument("--rtol", type=float, default=1.6e-2)
     parser.add_argument("--atol", type=float, default=1.0e-2)
     parser.add_argument("--output", type=Path, required=True)
@@ -96,6 +99,7 @@ def benchmark_args(args: argparse.Namespace) -> argparse.Namespace:
         world_size=args.world_size,
         backend=args.backend,
         tokens=args.tokens,
+        rank_tokens=args.rank_tokens,
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         num_experts=args.num_experts,
@@ -109,6 +113,7 @@ def benchmark_args(args: argparse.Namespace) -> argparse.Namespace:
         section_profile_iters=0,
         section_profile_warmup=0,
         section_profile_output=None,
+        route_target_rank=args.route_target_rank,
         phase_name="correctness",
         torch_profile_iters=0,
         torch_profile_warmup=0,
@@ -116,6 +121,18 @@ def benchmark_args(args: argparse.Namespace) -> argparse.Namespace:
         torch_profile_top_kernels=0,
         torch_profile_chrome_trace=False,
     )
+
+
+def tokens_for_rank(args: argparse.Namespace, rank: int) -> int:
+    if args.rank_tokens is None:
+        return args.tokens
+    return args.rank_tokens[rank]
+
+
+def tokens_across_dp(args: argparse.Namespace) -> list[int]:
+    if args.rank_tokens is None:
+        return [args.tokens for _ in range(args.world_size)]
+    return list(args.rank_tokens)
 
 
 def configure_common_env(args: argparse.Namespace) -> None:
@@ -139,11 +156,16 @@ def clear_env_cache() -> None:
         cache_clear()
 
 
-def configure_setting(setting: CorrectnessSetting) -> None:
+def configure_setting(setting: CorrectnessSetting, args: argparse.Namespace) -> None:
     os.environ["VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE"] = str(setting.w1_block_m)
     os.environ["VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE"] = str(setting.w2_block_m)
     os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH"] = (
         "1" if setting.fixed_capacity else "0"
+    )
+    os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS"] = (
+        str(args.fixed_capacity_num_worst_tokens or sum(tokens_across_dp(args)))
+        if setting.fixed_capacity
+        else "0"
     )
     clear_env_cache()
 
@@ -206,6 +228,7 @@ def write_output(
         "backend": args.backend,
         "world_size": args.world_size,
         "tokens": args.tokens,
+        "rank_tokens": args.rank_tokens,
         "hidden_size": args.hidden_size,
         "intermediate_size": args.intermediate_size,
         "num_experts": args.num_experts,
@@ -213,6 +236,8 @@ def write_output(
         "weight_seed": args.seed,
         "input_seed_base": args.input_seed_base,
         "rank_distinct_inputs": args.rank_distinct_inputs,
+        "route_target_rank": args.route_target_rank,
+        "fixed_capacity_num_worst_tokens": args.fixed_capacity_num_worst_tokens,
         "rtol": args.rtol,
         "atol": args.atol,
         "settings": [asdict(setting) for setting in SETTINGS],
@@ -257,7 +282,7 @@ def run_worker(
         outputs: dict[str, torch.Tensor] = {}
         assignment_stats: list[dict[str, Any]] = []
         for setting in SETTINGS:
-            configure_setting(setting)
+            configure_setting(setting, args)
             output = forward_once()
             torch.accelerator.synchronize()
             outputs[setting.name] = output.detach().clone()
@@ -279,7 +304,7 @@ def run_worker(
             asdict(
                 compare_outputs(
                     rank=rank,
-                    tokens=args.tokens,
+                    tokens=tokens_for_rank(args, rank),
                     reference_name=reference_name,
                     reference=reference,
                     setting_name=setting.name,
@@ -304,6 +329,8 @@ def run_worker(
 
 def main() -> None:
     args = parse_args()
+    if args.rank_tokens is not None and len(args.rank_tokens) != args.world_size:
+        raise ValueError("--rank-tokens must provide one value per rank")
     configure_common_env(args)
     if args.num_experts % args.world_size != 0:
         raise ValueError("--num-experts must be divisible by --world-size")

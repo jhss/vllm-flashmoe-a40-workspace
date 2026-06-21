@@ -284,6 +284,24 @@ def benchmark_command(args: argparse.Namespace, tokens: int, input_seed_base: in
     return cmd
 
 
+def prepare_run_env(
+    args: argparse.Namespace,
+    common: dict[str, str],
+    setting: Setting,
+    tokens: int,
+) -> dict[str, str]:
+    env = dict(common)
+    env.update(setting.env)
+    if (
+        env.get("VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH") == "1"
+        and int(env.get("VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS", "0")) <= 0
+    ):
+        env["VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS"] = str(
+            tokens * args.world_size
+        )
+    return env
+
+
 def section_profile_path(
     args: argparse.Namespace,
     setting: Setting,
@@ -377,8 +395,7 @@ def main() -> None:
                         if args.limit and runs > args.limit:
                             return
 
-                        env = dict(common)
-                        env.update(setting.env)
+                        env = prepare_run_env(args, common, setting, tokens)
                         cmd = benchmark_command(args, tokens, input_seed_base)
                         profile_path = section_profile_path(
                             args, setting, tokens, input_seed_base, cycle

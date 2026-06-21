@@ -797,6 +797,13 @@ class FusedMoEExperts(ABC):
         """
         return False
 
+    def supports_deepep_ht_fixed_capacity(self) -> bool:
+        """
+        Whether this experts implementation can consume DeepEP HT fixed-size
+        receive buffers without per-expert token metadata.
+        """
+        return False
+
 
 class FusedMoEExpertsModular(FusedMoEExperts):
     """

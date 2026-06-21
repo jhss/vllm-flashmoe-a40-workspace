@@ -605,6 +605,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     def supports_deepep_ht_raw_local_ids(self) -> bool:
         return True
 
+    def supports_deepep_ht_fixed_capacity(self) -> bool:
+        return True
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 

@@ -1,0 +1,248 @@
+{
+  "assignment_stats": [
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": null,
+        "ep_ignore_enabled": null,
+        "ep_ignore_num_tokens": null,
+        "invalid_route_pairs": 0,
+        "received_tokens": 0,
+        "valid_route_pairs": 0
+      },
+      "rank": 0,
+      "setting": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": null,
+        "ep_ignore_enabled": null,
+        "ep_ignore_num_tokens": null,
+        "invalid_route_pairs": 0,
+        "received_tokens": 0,
+        "valid_route_pairs": 0
+      },
+      "rank": 0,
+      "setting": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": null,
+        "ep_ignore_enabled": null,
+        "ep_ignore_num_tokens": null,
+        "invalid_route_pairs": 0,
+        "received_tokens": 0,
+        "valid_route_pairs": 0
+      },
+      "rank": 0,
+      "setting": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "fixed_capacity": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p0:b0/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 0,
+      "setting": "fixed_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m128:p8192:b64/0:sr1.60:vr1.60",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": 0,
+        "received_tokens": 640,
+        "valid_route_pairs": 5120
+      },
+      "rank": 1,
+      "setting": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m64:p8064:b126/0:sr1.57:vr1.57",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": 0,
+        "received_tokens": 640,
+        "valid_route_pairs": 5120
+      },
+      "rank": 1,
+      "setting": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m32:p6208:b194/0:sr1.21:vr1.21",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": 0,
+        "received_tokens": 640,
+        "valid_route_pairs": 5120
+      },
+      "rank": 1,
+      "setting": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "fixed_capacity": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p8064:b126/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 1,
+      "setting": "fixed_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    }
+  ],
+  "atol": 0.01,
+  "backend": "deepep_high_throughput",
+  "fixed_capacity_num_worst_tokens": 0,
+  "hidden_size": 2048,
+  "input_seed_base": 1007,
+  "intermediate_size": 768,
+  "metrics": [
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_64",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_32",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "fixed_both_64",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_64",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_32",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "fixed_both_64",
+      "tokens": 512
+    }
+  ],
+  "num_experts": 128,
+  "rank_distinct_inputs": true,
+  "rank_tokens": [
+    128,
+    512
+  ],
+  "route_target_rank": 1,
+  "rtol": 0.016,
+  "settings": [
+    {
+      "fixed_capacity": false,
+      "name": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "name": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "name": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "fixed_capacity": true,
+      "name": "fixed_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    }
+  ],
+  "tokens": 512,
+  "top_k": 8,
+  "weight_seed": 7,
+  "world_size": 2
+}

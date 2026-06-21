@@ -164,6 +164,13 @@ Run the following experiments in order:
      `num_worst_tokens`, skips CPU count-list metadata creation, and requires
      generic `ignore-invalid` handling. Correctness smoke passed for tokens
      320/448.
+   - Tightened fixed-capacity safety: explicit
+     `VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS` is now required, the
+     value is checked against `sum(num_tokens_across_dp)`, unsupported
+     backend/quant/LoRA paths are rejected, and the receiver gets an explicit
+     fixed-capacity flag instead of inferring mode from an empty count list.
+     Asymmetric `128/512`, `512/128`, and target-rank-concentrated smoke tests
+     passed; intentionally small capacity fails before dispatch.
    - Fixed-capacity vs `final_both_64` paired result:
      tokens 320 improved about `-4.0%` with `10/12` wins, and tokens 448
      improved about `-4.5%` with `12/12` wins.

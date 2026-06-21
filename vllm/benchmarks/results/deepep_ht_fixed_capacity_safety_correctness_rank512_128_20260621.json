@@ -1,0 +1,248 @@
+{
+  "assignment_stats": [
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m128:p8192:b64/0:sr3.18:vr3.18",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": 2543,
+        "received_tokens": 640,
+        "valid_route_pairs": 2577
+      },
+      "rank": 0,
+      "setting": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:sr1.59:vr1.59",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": 2543,
+        "received_tokens": 640,
+        "valid_route_pairs": 2577
+      },
+      "rank": 0,
+      "setting": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m32:p3872:b121/0:sr1.50:vr1.50",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": 2543,
+        "received_tokens": 640,
+        "valid_route_pairs": 2577
+      },
+      "rank": 0,
+      "setting": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "fixed_capacity": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 0,
+      "setting": "fixed_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m128:p8192:b64/0:sr3.22:vr3.22",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 637,
+        "invalid_route_pairs": 2553,
+        "received_tokens": 637,
+        "valid_route_pairs": 2543
+      },
+      "rank": 1,
+      "setting": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:sr1.61:vr1.61",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 637,
+        "invalid_route_pairs": 2553,
+        "received_tokens": 637,
+        "valid_route_pairs": 2543
+      },
+      "rank": 1,
+      "setting": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "local_stats": {
+        "assignment_stats": "0:m32:p3840:b120/0:sr1.51:vr1.51",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 637,
+        "invalid_route_pairs": 2553,
+        "received_tokens": 637,
+        "valid_route_pairs": 2543
+      },
+      "rank": 1,
+      "setting": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "fixed_capacity": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 1,
+      "setting": "fixed_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    }
+  ],
+  "atol": 0.01,
+  "backend": "deepep_high_throughput",
+  "fixed_capacity_num_worst_tokens": 0,
+  "hidden_size": 2048,
+  "input_seed_base": 1007,
+  "intermediate_size": 768,
+  "metrics": [
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_64",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_32",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "fixed_both_64",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_64",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_32",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "fixed_both_64",
+      "tokens": 128
+    }
+  ],
+  "num_experts": 128,
+  "rank_distinct_inputs": true,
+  "rank_tokens": [
+    512,
+    128
+  ],
+  "route_target_rank": -1,
+  "rtol": 0.016,
+  "settings": [
+    {
+      "fixed_capacity": false,
+      "name": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "name": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "name": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "fixed_capacity": true,
+      "name": "fixed_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    }
+  ],
+  "tokens": 512,
+  "top_k": 8,
+  "weight_seed": 7,
+  "world_size": 2
+}
