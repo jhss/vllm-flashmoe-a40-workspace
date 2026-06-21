@@ -1,0 +1,171 @@
+{
+  "assignment_stats": [
+    {
+      "local_stats": {
+        "assignment_stats": "0:m128:p8192:b64/0:sr2.24:vr2.24",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 896,
+        "invalid_route_pairs": 3509,
+        "received_tokens": 896,
+        "valid_route_pairs": 3659
+      },
+      "rank": 0,
+      "setting": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "local_stats": {
+        "assignment_stats": "0:m64:p4736:b74/0:sr1.29:vr1.29",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 896,
+        "invalid_route_pairs": 3509,
+        "received_tokens": 896,
+        "valid_route_pairs": 3659
+      },
+      "rank": 0,
+      "setting": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "local_stats": {
+        "assignment_stats": "0:m32:p4416:b138/0:sr1.21:vr1.21",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 896,
+        "invalid_route_pairs": 3509,
+        "received_tokens": 896,
+        "valid_route_pairs": 3659
+      },
+      "rank": 0,
+      "setting": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    },
+    {
+      "local_stats": {
+        "assignment_stats": "0:m128:p8192:b64/0:sr2.33:vr2.33",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 890,
+        "invalid_route_pairs": 3611,
+        "received_tokens": 890,
+        "valid_route_pairs": 3509
+      },
+      "rank": 1,
+      "setting": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "local_stats": {
+        "assignment_stats": "0:m64:p4544:b71/0:sr1.29:vr1.29",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 890,
+        "invalid_route_pairs": 3611,
+        "received_tokens": 890,
+        "valid_route_pairs": 3509
+      },
+      "rank": 1,
+      "setting": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "local_stats": {
+        "assignment_stats": "0:m32:p4320:b135/0:sr1.23:vr1.23",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 890,
+        "invalid_route_pairs": 3611,
+        "received_tokens": 890,
+        "valid_route_pairs": 3509
+      },
+      "rank": 1,
+      "setting": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    }
+  ],
+  "atol": 0.01,
+  "backend": "deepep_high_throughput",
+  "hidden_size": 2048,
+  "input_seed_base": 1007,
+  "intermediate_size": 768,
+  "metrics": [
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_64",
+      "tokens": 448
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 0,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_32",
+      "tokens": 448
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_64",
+      "tokens": 448
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "rank": 1,
+      "reference": "block_default",
+      "relative_l2_error": 0.0,
+      "rtol": 0.016,
+      "setting": "block_both_32",
+      "tokens": 448
+    }
+  ],
+  "num_experts": 128,
+  "rank_distinct_inputs": true,
+  "rtol": 0.016,
+  "settings": [
+    {
+      "name": "block_default",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "name": "block_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "name": "block_both_32",
+      "w1_block_m": 32,
+      "w2_block_m": 32
+    }
+  ],
+  "tokens": 448,
+  "top_k": 8,
+  "weight_seed": 7,
+  "world_size": 2
+}

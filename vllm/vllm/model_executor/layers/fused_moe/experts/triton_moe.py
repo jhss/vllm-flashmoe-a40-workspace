@@ -69,6 +69,16 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 logger = init_logger(__name__)
 
+_SUPPORTED_BLOCK_M_OVERRIDES = frozenset({32, 64, 128})
+
+
+def _validate_block_m_override(value: int, env_var: str) -> None:
+    if value > 0 and value not in _SUPPORTED_BLOCK_M_OVERRIDES:
+        supported = ", ".join(str(block_m) for block_m in _SUPPORTED_BLOCK_M_OVERRIDES)
+        raise ValueError(
+            f"{env_var}={value} is not supported. Supported values: {supported}."
+        )
+
 
 def _a100_moe_tuned_config(config: dict[str, int]) -> dict[str, int]:
     tuned_config = dict(config)
@@ -130,6 +140,9 @@ def _maybe_get_a100_w1_config(
     lora_enabled: bool,
 ) -> dict[str, int]:
     block_m_override = envs.VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE
+    _validate_block_m_override(
+        block_m_override, "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE"
+    )
     if (
         block_m_override > 0
         and _is_a100_tuned_common_shape(
@@ -182,6 +195,9 @@ def _maybe_get_a100_w2_config(
     lora_enabled: bool,
 ) -> dict[str, int]:
     block_m_override = envs.VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE
+    _validate_block_m_override(
+        block_m_override, "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE"
+    )
     if (
         block_m_override > 0
         and _is_a100_tuned_common_shape(

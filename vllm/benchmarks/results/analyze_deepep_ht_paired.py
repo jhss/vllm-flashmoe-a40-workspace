@@ -15,6 +15,9 @@ from typing import Any
 
 DEFAULT_CSV = "deepep_ht_paired_ignore_20260620_raw.csv"
 SETTING_ORDER = (
+    "original",
+    "filtering",
+    "final_both_64",
     "baseline",
     "ignore_off",
     "global_ignore",
@@ -143,6 +146,8 @@ def baseline_setting(rows: list[dict[str, Any]]) -> str:
         return "baseline"
     if "ignore_off" in settings:
         return "ignore_off"
+    if "original" in settings:
+        return "original"
     if "block_default" in settings:
         return "block_default"
     return settings[0]

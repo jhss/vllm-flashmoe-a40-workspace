@@ -149,9 +149,20 @@ Run the following experiments in order:
    - `both_64` was best in the screening: median paired deltas were about
      `-8.9%` at both tokens with `9/9` wins. `both_32` also won, but was
      slower than `both_64`, so padding alone is not sufficient.
-   - Next split W1/W2 contribution before running a broad sweep:
-     `tokens=320,448`, settings `default,w1_64,w2_64,both_64`, seeds
-     `1007,2007,3007`, cycles `4`.
+   - Completed W1/W2 contribution split with `tokens=320,448`, settings
+     `default,w1_64,w2_64,both_64`, seeds `1007,2007,3007`, and 4 cyclic
+     cycles. `both_64` was best and won `12/12` pairs at both tokens. W1-only
+     carried most single-side gain; W2-only was a smaller, noisier win.
+   - Completed same-session combined ablation:
+     `original = ignore-invalid OFF + default BLOCK_M`,
+     `filtering = ignore-invalid ON + default BLOCK_M`,
+     `final_both_64 = ignore-invalid ON + W1/W2 BLOCK_M=64`.
+     Final improved original by about `-12.9%` at tokens 320 and `-10.5%`
+     at tokens 448. Filtering alone accounted for about `-2.6%` and `-3.3%`.
+   - Next find the M64/M128 crossover with only `default` vs `final_both_64`
+     over tokens `256,320,384,448,512,640,768,1024`, 3 seeds, and 3 balanced
+     cycles. After locating the boundary, rerun only boundary tokens with
+     5 seeds and 4 cycles.
    - Runner examples:
      `python benchmarks/results/run_deepep_ht_paired_matrix.py --mode block-m-screening`
      and

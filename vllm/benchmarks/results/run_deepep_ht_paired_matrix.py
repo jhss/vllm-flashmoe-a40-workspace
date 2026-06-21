@@ -21,6 +21,7 @@ from pathlib import Path
 DEFAULT_BREAK_EVEN_TOKENS = [8, 16, 32, 48, 64, 96, 128]
 DEFAULT_BLOCK_M_TOKENS = [256, 320, 384, 448]
 DEFAULT_BLOCK_M_SCREENING_TOKENS = [320, 448]
+DEFAULT_BLOCK_M_COMBINED_ABLATION_TOKENS = [320, 448]
 DEFAULT_INPUT_SEEDS = [1007, 2007, 3007, 4007, 5007]
 DEFAULT_SCREENING_INPUT_SEEDS = [1007, 2007, 3007]
 DEFAULT_RESULT_DIR = Path(__file__).resolve().parent
@@ -39,7 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["break-even", "block-m-sweep", "block-m-screening"],
+        choices=[
+            "break-even",
+            "block-m-sweep",
+            "block-m-screening",
+            "block-m-combined-ablation",
+        ],
         default="break-even",
     )
     parser.add_argument("--output", type=Path)
@@ -83,6 +89,8 @@ def default_output(mode: str) -> Path:
         name = "deepep_ht_break_even_sub254_20260621_raw.csv"
     elif mode == "block-m-screening":
         name = "deepep_ht_block_m_screening_20260621_raw.csv"
+    elif mode == "block-m-combined-ablation":
+        name = "deepep_ht_block_m_combined_ablation_20260621_raw.csv"
     else:
         name = "deepep_ht_block_m_sweep_20260621_raw.csv"
     return DEFAULT_RESULT_DIR / name
@@ -93,17 +101,19 @@ def default_tokens(mode: str) -> list[int]:
         return DEFAULT_BREAK_EVEN_TOKENS
     if mode == "block-m-screening":
         return DEFAULT_BLOCK_M_SCREENING_TOKENS
+    if mode == "block-m-combined-ablation":
+        return DEFAULT_BLOCK_M_COMBINED_ABLATION_TOKENS
     return DEFAULT_BLOCK_M_TOKENS
 
 
 def default_input_seeds(mode: str) -> list[int]:
-    if mode == "block-m-screening":
+    if mode in ("block-m-screening", "block-m-combined-ablation"):
         return DEFAULT_SCREENING_INPUT_SEEDS
     return DEFAULT_INPUT_SEEDS
 
 
 def default_cycles(mode: str) -> int:
-    if mode == "block-m-screening":
+    if mode in ("block-m-screening", "block-m-combined-ablation"):
         return 3
     return 4
 
@@ -188,6 +198,39 @@ def block_m_settings(names: list[str]) -> list[Setting]:
             )
         )
     return settings
+
+
+def block_m_combined_ablation_settings() -> list[Setting]:
+    return [
+        Setting(
+            name="original",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "0",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+            },
+            threshold=0,
+        ),
+        Setting(
+            name="filtering",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "1",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+            },
+            threshold=0,
+        ),
+        Setting(
+            name="final_both_64",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "1",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+                "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": "64",
+                "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": "64",
+            },
+            threshold=0,
+            w1_block_m=64,
+            w2_block_m=64,
+        ),
+    ]
 
 
 def cycle_settings(settings: list[Setting], cycle: int) -> list[Setting]:
@@ -308,6 +351,8 @@ def main() -> None:
         settings_groups = [
             break_even_settings(threshold) for threshold in args.thresholds
         ]
+    elif args.mode == "block-m-combined-ablation":
+        settings_groups = [block_m_combined_ablation_settings()]
     else:
         settings_groups = [block_m_settings(block_m_setting_names)]
 

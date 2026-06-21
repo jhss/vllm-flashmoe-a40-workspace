@@ -3016,3 +3016,135 @@ cycles:   4
 
 여기서 W1/W2 중 어느 쪽의 `BLOCK_M=64`가 실제 이득을 만드는지 확인한 뒤,
 winner만 256/320/384/448 범위에서 5-seed final validation으로 확장한다.
+
+## 22. BLOCK_M correctness, W1/W2 split, combined ablation
+
+Section 21 이후 세 가지를 보완했다.
+
+1. benchmark-only `BLOCK_M` override validation
+2. final output correctness smoke
+3. W1/W2 contribution split과 same-session combined ablation
+
+Override validation:
+
+```text
+VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE
+VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE
+```
+
+위 두 env hook은 이제 `32,64,128`만 허용한다. `48` 같은 값은 바로
+`ValueError`를 낸다.
+
+Correctness smoke:
+
+```text
+benchmarks/results/verify_deepep_ht_block_m_correctness.py
+benchmarks/results/deepep_ht_block_m_correctness_tokens320_20260621.json
+benchmarks/results/deepep_ht_block_m_correctness_tokens448_20260621.json
+```
+
+두 token size에서 `block_default` output을 reference로 두고 `block_both_64`,
+`block_both_32`를 비교했다. tolerance는 BF16용 `rtol=1.6e-2`,
+`atol=1.0e-2`다.
+
+```text
+tokens  rank  setting        max_abs  mean_abs  rel_l2  assert_close
+320     0     block_both_64  0.0      0.0       0.0     true
+320     0     block_both_32  0.0      0.0       0.0     true
+320     1     block_both_64  0.0      0.0       0.0     true
+320     1     block_both_32  0.0      0.0       0.0     true
+448     0     block_both_64  0.0      0.0       0.0     true
+448     0     block_both_32  0.0      0.0       0.0     true
+448     1     block_both_64  0.0      0.0       0.0     true
+448     1     block_both_32  0.0      0.0       0.0     true
+```
+
+W1/W2 split:
+
+```text
+benchmarks/results/deepep_ht_block_m_w1_w2_split_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_block_m_w1_w2_split_20260621_3seed_commands.log
+benchmarks/results/deepep_ht_block_m_w1_w2_split_20260621_3seed_summary.md
+```
+
+Run shape:
+
+```text
+tokens:       320, 448
+settings:     block_default, block_w1_64, block_w2_64, block_both_64
+input seeds:  1007, 2007, 3007
+cycles:       4-way cyclic order
+warmup/iters: 20 / 100
+rows:         96 measurements, 72 paired comparisons
+```
+
+Paired critical-path delta, `setting - block_default`:
+
+```text
+tokens  setting        median delta  pair pct   wins
+320     block_w1_64    -93.6 us      -5.73%     12/12
+320     block_w2_64    -29.5 us      -1.82%     10/12
+320     block_both_64  -175.0 us     -10.77%    12/12
+448     block_w1_64    -69.5 us      -4.20%     11/12
+448     block_w2_64    -26.3 us      -1.59%     11/12
+448     block_both_64  -143.6 us     -8.62%     12/12
+```
+
+W1-only가 대부분의 단독 이득을 설명하지만, W2-only도 median 기준 이득이다.
+다만 W2-only에는 positive transient가 있었다. `block_both_64`는 두 token
+size 모두 `12/12` wins로 가장 안정적이며, 단독 W1/W2보다 크다. 따라서 다음
+policy 후보는 W1/W2 양쪽 M64다.
+
+Same-session combined ablation:
+
+```text
+benchmarks/results/deepep_ht_block_m_combined_ablation_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_block_m_combined_ablation_20260621_3seed_commands.log
+benchmarks/results/deepep_ht_block_m_combined_ablation_20260621_3seed_summary.md
+```
+
+Run shape:
+
+```text
+tokens:       320, 448
+settings:     original, filtering, final_both_64
+input seeds:  1007, 2007, 3007
+cycles:       3-way Latin square
+warmup/iters: 20 / 100
+rows:         54 measurements, 36 paired comparisons
+```
+
+Settings:
+
+```text
+original:      ignore-invalid OFF, default BLOCK_M
+filtering:     ignore-invalid ON, default BLOCK_M
+final_both_64: ignore-invalid ON, W1/W2 BLOCK_M=64
+```
+
+Paired critical-path delta, `setting - original`:
+
+```text
+tokens  setting        median delta  pair pct   wins
+320     filtering      -43.6 us      -2.65%     9/9
+320     final_both_64  -213.4 us     -12.87%    9/9
+448     filtering      -56.7 us      -3.34%     8/9
+448     final_both_64  -178.6 us     -10.52%    9/9
+```
+
+`final_both_64 - filtering` 추가 이득:
+
+```text
+tokens  median delta  pair pct  wins
+320     -160.3 us     -9.99%    9/9
+448     -137.3 us     -8.37%    9/9
+```
+
+따라서 같은 세션에서도 contribution split이 명확하다. `ignore-invalid`는
+기존 경로 대비 약 2.6-3.3%를 만들고, W1/W2 M64는 그 위에서 약 8.4-10.0%를
+추가한다. 최종 후보는 original 대비 약 10.5-12.9% 빠르다.
+
+다음은 모든 setting을 넓게 돌리는 full sweep이 아니라 M64/M128 crossover
+탐색이다. 우선 `default` vs `final_both_64`만 비교해 token range
+`256,320,384,448,512,640,768,1024`에서 상한을 찾고, 경계 주변만 5 seeds
+× 4 cycles로 재검증한다.
