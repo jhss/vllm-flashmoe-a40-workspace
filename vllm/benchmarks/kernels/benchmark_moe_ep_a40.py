@@ -22,10 +22,11 @@ import argparse
 import json
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from torch.multiprocessing import spawn
@@ -246,20 +247,26 @@ def make_layer_and_inputs(
     dtype = torch.bfloat16
     device = torch.device("cuda", rank)
 
-    full_w13 = torch.randn(
-        args.num_experts,
-        2 * args.intermediate_size,
-        args.hidden_size,
-        device=device,
-        dtype=dtype,
-    ) / 10
-    full_w2 = torch.randn(
-        args.num_experts,
-        args.hidden_size,
-        args.intermediate_size,
-        device=device,
-        dtype=dtype,
-    ) / 10
+    full_w13 = (
+        torch.randn(
+            args.num_experts,
+            2 * args.intermediate_size,
+            args.hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        / 10
+    )
+    full_w2 = (
+        torch.randn(
+            args.num_experts,
+            args.hidden_size,
+            args.intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        / 10
+    )
 
     with set_current_vllm_config(vllm_config):
         layer = FusedMoE(
@@ -356,7 +363,6 @@ def expert_token_stats(
 
 
 class SectionProfiler:
-
     def __init__(self) -> None:
         self.samples_ms: dict[str, list[float]] = {}
 
@@ -411,20 +417,24 @@ def _stat_bool(value: Any) -> bool | None:
     return bool(value)
 
 
-def format_assignment_stats(assignments: list[dict[str, int]]) -> str | None:
+def _format_ratio(value: float | None) -> str:
+    if value is None:
+        return "na"
+    return f"{value:.2f}"
+
+
+def format_assignment_stats(assignments: list[dict[str, Any]]) -> str | None:
     if not assignments:
         return None
-    seen: dict[int, dict[str, int]] = {}
-    for item in assignments:
-        seen[int(item["block_m"])] = item
     parts = []
-    for block_m in sorted(seen):
-        item = seen[block_m]
+    for idx, item in enumerate(assignments):
         parts.append(
-            f"{block_m}:"
-            f"{item['num_tokens_post_padded']}/"
-            f"{item['valid_blocks']}/"
-            f"{item['invalid_blocks']}"
+            f"{idx}:"
+            f"m{item['block_m']}:"
+            f"p{item['num_tokens_post_padded']}:"
+            f"b{item['valid_blocks']}/{item['invalid_blocks']}:"
+            f"sr{_format_ratio(item.get('scheduled_padding_ratio'))}:"
+            f"vr{_format_ratio(item.get('valid_padding_ratio'))}"
         )
     return ";".join(parts)
 
@@ -438,9 +448,7 @@ def summarize_ep_stats() -> dict[str, Any]:
         "invalid_route_pairs": _stat_int(receiver.get("invalid_route_pairs")),
         "ep_ignore_enabled": _stat_bool(ignore.get("enabled")),
         "ep_ignore_num_tokens": _stat_int(ignore.get("num_tokens")),
-        "assignment_stats": format_assignment_stats(
-            _EP_STATS.get("assignments", [])
-        ),
+        "assignment_stats": format_assignment_stats(_EP_STATS.get("assignments", [])),
     }
 
 
@@ -481,7 +489,7 @@ def _wrap_deepep_ht_receiver_stats(cls: type) -> None:
     if hasattr(cls, original_attr):
         return
 
-    original = getattr(cls, "_receiver")
+    original = cls._receiver
 
     def wrapped(self, *args, **kwargs):
         result = original(self, *args, **kwargs)
@@ -505,7 +513,7 @@ def _wrap_deepep_ht_receiver_stats(cls: type) -> None:
         return result
 
     setattr(cls, original_attr, original)
-    setattr(cls, "_receiver", wrapped)
+    cls._receiver = wrapped
 
 
 def _wrap_ep_ignore_stats(triton_moe_module) -> None:
@@ -525,7 +533,7 @@ def _wrap_ep_ignore_stats(triton_moe_module) -> None:
         return result
 
     setattr(triton_moe_module, original_attr, original)
-    setattr(triton_moe_module, "_use_ep_ignore_invalid_experts", wrapped)
+    triton_moe_module._use_ep_ignore_invalid_experts = wrapped
 
 
 def _wrap_assignment_stats(triton_moe_module) -> None:
@@ -545,18 +553,36 @@ def _wrap_assignment_stats(triton_moe_module) -> None:
             used_blocks = (post_padded + block_m - 1) // block_m
             used_expert_ids = expert_ids[:used_blocks]
             valid_blocks = int((used_expert_ids >= 0).sum().item())
+            receiver = _EP_STATS.get("receiver", {})
+            ignore = _EP_STATS.get("ignore", {})
+            valid_route_pairs = _stat_int(receiver.get("valid_route_pairs"))
+            invalid_route_pairs = _stat_int(receiver.get("invalid_route_pairs"))
+            if valid_route_pairs is None:
+                scheduled_route_pairs = None
+            elif _stat_bool(ignore.get("enabled")):
+                scheduled_route_pairs = valid_route_pairs
+            else:
+                scheduled_route_pairs = valid_route_pairs + (invalid_route_pairs or 0)
             _EP_STATS["assignments"].append(
                 {
                     "block_m": block_m,
                     "num_tokens_post_padded": post_padded,
                     "valid_blocks": valid_blocks,
                     "invalid_blocks": used_blocks - valid_blocks,
+                    "scheduled_padding_ratio": (
+                        post_padded / scheduled_route_pairs
+                        if scheduled_route_pairs
+                        else None
+                    ),
+                    "valid_padding_ratio": (
+                        post_padded / valid_route_pairs if valid_route_pairs else None
+                    ),
                 }
             )
         return result
 
     setattr(triton_moe_module, original_attr, original)
-    setattr(triton_moe_module, "_prepare_triton_expert_assignment", wrapped)
+    triton_moe_module._prepare_triton_expert_assignment = wrapped
 
 
 def collect_ep_stats(
@@ -597,9 +623,7 @@ def install_section_profilers() -> None:
     from vllm.model_executor.layers.fused_moe import modular_kernel as mk
     from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
 
-    _wrap_profiled_method(
-        mk.FusedMoEKernelModularImpl, "_prepare", "moe_prepare_total"
-    )
+    _wrap_profiled_method(mk.FusedMoEKernelModularImpl, "_prepare", "moe_prepare_total")
     _wrap_profiled_method(
         mk.FusedMoEKernelModularImpl, "_fused_experts", "moe_experts_total"
     )
@@ -640,7 +664,7 @@ def _wrap_deepep_ht_receiver_details(
     if hasattr(cls, original_attr):
         return
 
-    original = getattr(cls, "_receiver")
+    original = cls._receiver
 
     def wrapped(
         self,
@@ -745,7 +769,7 @@ def _wrap_deepep_ht_receiver_details(
         )
 
     setattr(cls, original_attr, original)
-    setattr(cls, "_receiver", wrapped)
+    cls._receiver = wrapped
 
 
 def _wrap_deepep_ht_dispatch(cls: type) -> None:
@@ -753,7 +777,7 @@ def _wrap_deepep_ht_dispatch(cls: type) -> None:
     if hasattr(cls, original_attr):
         return
 
-    original = getattr(cls, "_do_dispatch")
+    original = cls._do_dispatch
 
     def wrapped(self, *args, **kwargs):
         profiler = _SECTION_PROFILER
@@ -772,7 +796,7 @@ def _wrap_deepep_ht_dispatch(cls: type) -> None:
         return profiled_receiver
 
     setattr(cls, original_attr, original)
-    setattr(cls, "_do_dispatch", wrapped)
+    cls._do_dispatch = wrapped
 
 
 def _wrap_deepep_ht_finalize(cls: type) -> None:
@@ -780,7 +804,7 @@ def _wrap_deepep_ht_finalize(cls: type) -> None:
     if hasattr(cls, original_attr):
         return
 
-    original = getattr(cls, "_finalize")
+    original = cls._finalize
 
     def wrapped(self, *args, **kwargs):
         profiler = _SECTION_PROFILER
@@ -801,7 +825,7 @@ def _wrap_deepep_ht_finalize(cls: type) -> None:
         return profiled_receiver
 
     setattr(cls, original_attr, original)
-    setattr(cls, "_finalize", wrapped)
+    cls._finalize = wrapped
 
 
 def section_profile_path(base: Path, rank: int) -> Path:
@@ -1052,12 +1076,8 @@ def run_worker(
                 input_seed_for_rank(args, 1) if args.world_size > 1 else None
             ),
             input_tokens=args.tokens,
-            received_tokens_rank0=_rank_stat(
-                ep_stats_by_rank, 0, "received_tokens"
-            ),
-            received_tokens_rank1=_rank_stat(
-                ep_stats_by_rank, 1, "received_tokens"
-            ),
+            received_tokens_rank0=_rank_stat(ep_stats_by_rank, 0, "received_tokens"),
+            received_tokens_rank1=_rank_stat(ep_stats_by_rank, 1, "received_tokens"),
             ep_ignore_enabled_rank0=_rank_stat(
                 ep_stats_by_rank, 0, "ep_ignore_enabled"
             ),
@@ -1082,12 +1102,8 @@ def run_worker(
             invalid_route_pairs_rank1=_rank_stat(
                 ep_stats_by_rank, 1, "invalid_route_pairs"
             ),
-            assignment_stats_rank0=_rank_stat(
-                ep_stats_by_rank, 0, "assignment_stats"
-            ),
-            assignment_stats_rank1=_rank_stat(
-                ep_stats_by_rank, 1, "assignment_stats"
-            ),
+            assignment_stats_rank0=_rank_stat(ep_stats_by_rank, 0, "assignment_stats"),
+            assignment_stats_rank1=_rank_stat(ep_stats_by_rank, 1, "assignment_stats"),
             topk_us=topk_us,
             dispatch_us=dispatch_us,
             combine_us=combine_us,

@@ -2710,14 +2710,228 @@ positive delta outliers:
 2. 384와 512 tokens에서는 15/15 paired run이 모두 이겼고, 128/320/640/768도
    14/15로 대부분 이겼다.
 
-3. 몇 개 큰 positive outlier가 있어 default 변경 전 correctness와 한 번 더
-   짧은 confirmation run은 필요하다. 그래도 median과 seed별 median은
-   forced ON 우세로 일관된다.
+3. Raw CSV 재계산 기준으로도 paired median과 win count가 위 table과
+   일치한다. Seed별 median은 대부분 음수였고, 192-token의 seed=4007만
+   양수였으므로 특정 routing seed 하나에만 의존한 결과로 보이지 않는다.
 
-4. 현재 데이터만 보면 `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS`
-   기본 후보는 1024보다 훨씬 낮아야 한다. 보수적인 후보는 received-M 256
-   또는 384이고, aggressive하게는 0도 가능해 보인다.
+4. 다만 실행 순서는 cycle 1/3이 baseline -> ON, cycle 2가 ON -> baseline인
+   2:1 구조라 완전히 균형적이지 않다. ON-first cycle에서도 대체로 이득은
+   유지되지만, 다음 confirmation run은 4-cycle balanced order로 잡는다:
+   OFF->ON, ON->OFF, ON->OFF, OFF->ON.
 
-5. 다음 코드는 global generic + ignore-invalid를 주력 경로로 유지하되,
+5. 몇 개 큰 positive transient outlier가 있다. Median 결론은 안정적이지만
+   default 변경 전에는 GPU clock 고정이 가능하면 고정하고, correctness와
+   balanced confirmation run을 추가한다.
+
+6. 현재 데이터가 말할 수 있는 정확한 결론은 "이 workload의 break-even은
+   M ~=254보다 낮고, 기존 1024 threshold는 지나치게 높다"이다.
+   input=128의 min/critical received M이 254~255라서 threshold=256은
+   이 최소 케이스의 한쪽 또는 양쪽 rank에서 ignore-invalid를 끌 수 있다.
+   input=128의 이득까지 보존하려면 threshold 후보는 192 또는 128 이하가
+   더 일관된다.
+
+7. 반대로 전역 기본값을 바로 0으로 내리는 것도 아직 이르다.
+   `_use_ep_ignore_invalid_experts()`는 DeepEP HT 전용 정책이 아니라
+   `expert_map`을 쓰는 Triton EP 경로 전반에 영향을 준다. 안전한 순서는
+   env override로 DeepEP HT에서 항상 ON 검증 -> DeepEP HT 전용 default
+   검토 -> 다른 backend/shape 측정 뒤 generic default 검토다.
+
+8. 다음 코드는 global generic + ignore-invalid를 주력 경로로 유지하되,
    local-ID나 direct assignment를 default 후보로 삼을 근거는 여전히 없다.
 ```
+
+다음 측정:
+
+```text
+1. 진짜 break-even 확인
+
+   input tokens:
+     8,16,32,48,64,96,128
+
+   5 seeds x 4 balanced cycles로 OFF/ON을 paired 측정한다.
+
+2. ignore ON 이후 BLOCK_SIZE_M matrix
+
+   tokens:
+     256,320,384,448
+
+   settings:
+     A. ignore ON + 현재 default config
+     B. ignore ON + W1 BLOCK_M=64
+     C. ignore ON + W2 BLOCK_M=64
+     D. ignore ON + W1/W2 BLOCK_M=64
+     E. ignore ON + W1/W2 BLOCK_M=32
+
+   필요하면 후보 BLOCK_M=32/64/128을 별도 sweep한다. W1과 W2는 padding
+   감소와 GEMM 효율 tradeoff가 다를 수 있으므로 분리해서 측정한다.
+
+3. 기록할 값
+
+   W1 latency, activation latency, W2 latency, reduce latency,
+   full critical-path latency, W1/W2 num_tokens_post_padded,
+   W1/W2 BLOCK_SIZE_M, valid blocks, padding ratio.
+```
+
+후속 구현 후보:
+
+```python
+padded_rows(block_m) = sum(
+    ceil_div(expert_count[e], block_m) * block_m
+    for e in local_experts
+)
+```
+
+invalid filtering 이후 expert histogram을 기준으로 후보 `BLOCK_M=32/64/128`
+각각의 padded rows를 계산하고, GEMM 효율 LUT를 얹어 W1/W2 config를 고르는
+routing-aware selector가 다음 큰 성능 기회다. 이후 ignore activation도
+단순 received-M threshold 대신, 제거되는 invalid GEMM program 수를 추정하는
+`saved_programs` 기준으로 바꾸는 쪽이 더 일반적이다.
+
+추가 검증:
+
+```text
+- uniform, moderately skewed, hot-expert 집중, 실제 model router trace 비교
+- 2-rank full output correctness 비교
+```
+
+## 20. Balanced runner and BLOCK_M sweep hook
+
+리뷰에서 지적한 두 후속 실험을 반복 가능하게 만들기 위해 runner를 추가했다.
+
+```text
+benchmarks/results/run_deepep_ht_paired_matrix.py
+```
+
+지원하는 matrix:
+
+```text
+1. break-even:
+   tokens 8,16,32,48,64,96,128
+   OFF/ON 5 seeds x 4 balanced cycles
+
+2. block-m-sweep:
+   tokens 256,320,384,448
+   ignore ON + default/W1/W2/both BLOCK_SIZE_M overrides
+```
+
+full break-even command:
+
+```bash
+python benchmarks/results/run_deepep_ht_paired_matrix.py \
+  --mode break-even \
+  --output benchmarks/results/deepep_ht_break_even_sub254_20260621_raw.csv
+```
+
+full BLOCK_M sweep command:
+
+```bash
+python benchmarks/results/run_deepep_ht_paired_matrix.py \
+  --mode block-m-sweep \
+  --output benchmarks/results/deepep_ht_block_m_sweep_20260621_raw.csv
+```
+
+W1/W2 각각의 tile만 바꿀 수 있도록 benchmark-only env hook도 추가했다.
+
+```text
+VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE
+VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE
+```
+
+이 hook은 A100/SM80, BF16, top-k=8, Mixtral-like synthetic shape에만 걸리고,
+env가 0이면 기존 config 선택을 그대로 둔다. 기존
+`VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG`와
+`VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG` default behavior는 바꾸지 않는다.
+
+Smoke verification:
+
+```text
+benchmarks/results/deepep_ht_break_even_sub254_20260621_smoke_raw.csv
+benchmarks/results/deepep_ht_block_m_sweep_20260621_smoke_raw.csv
+```
+
+break-even smoke는 `tokens=8`, `seed=1007`, `cycle=1`, `warmup=1`,
+`iters=2`로 runner/output/analyzer path만 확인했다.
+
+```text
+baseline critical path:      1891.7 us
+global_ignore critical path: 1773.9 us
+delta:                       -117.9 us (-6.23%)
+received M:                  15/16
+```
+
+이 수치는 짧은 smoke라 결론용 데이터는 아니지만, `received M<254`에서도
+measurement path가 동작하고 paired analyzer가 정상적으로 읽는다는 점을
+확인한다.
+
+BLOCK_M smoke는 `tokens=320`, `seed=1007`, `cycle=1`, `warmup=1`,
+`iters=2`로 default/W1_64/W2_64/both_32를 확인했다.
+
+```text
+block_default: 2139.2 us
+block_w1_64:  2196.0 us
+block_w2_64:  2260.5 us
+block_both_32:2025.0 us
+```
+
+대표 assignment stats:
+
+```text
+default:
+  0:m128:p8192:b64/0:sr3.19:vr3.19
+
+W1 BLOCK_M=64:
+  0:m128:p8192:b64/0:sr3.19:vr3.19;
+  1:m64:p4096:b64/0:sr1.59:vr1.59
+
+W2 BLOCK_M=64:
+  0:m128:p8192:b64/0:sr3.19:vr3.19;
+  1:m64:p4096:b64/0:sr1.59:vr1.59
+
+W1/W2 BLOCK_M=32:
+  0:m128:p8192:b64/0:sr3.19:vr3.19;
+  1:m32:p3872:b121/0:sr1.51:vr1.51
+```
+
+즉 override가 실제 W1/W2 assignment를 새 `BLOCK_SIZE_M`으로 다시 만들고,
+padding rows도 `8192 -> 4096 -> 3872`로 바뀐다. Smoke latency 자체는
+`iters=2`라 noisy하지만, `both_32`가 default보다 빠르게 나온 점은 full
+paired sweep을 돌릴 가치가 있다는 신호다.
+
+3-seed break-even pilot:
+
+```text
+benchmarks/results/deepep_ht_break_even_sub254_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_break_even_sub254_20260621_3seed_summary.md
+```
+
+Run shape:
+
+```text
+input seeds: 1007, 2007, 3007
+cycles:      4 balanced cycles per seed
+tokens:      8, 16, 32, 48, 64, 96, 128
+settings:    baseline vs forced global_ignore
+warmup/iters:20 / 100
+rows:        168 measurements, 84 paired comparisons
+```
+
+Paired critical-path delta, `global_ignore - baseline`:
+
+```text
+tokens  recv-M median  median delta  pair pct  wins
+8       16             -28.8 us      -2.23%    9/12
+16      31/32          -21.1 us      -1.58%    9/12
+32      63/64          -19.3 us      -1.38%    10/12
+48      95             -47.8 us      -3.41%    10/12
+64      127            -48.9 us      -3.41%    12/12
+96      191            -30.9 us      -2.19%    9/12
+128     254/255        -46.3 us      -3.22%    8/12
+```
+
+3-seed pilot에서도 모든 measured received-M 구간에서 median delta가 음수다.
+즉 이번 workload에서는 `received M=16`까지 내려가도 forced generic
+`ignore-invalid`의 break-even이 관측되지 않았다. 다만 `tokens=128`은
+seed 1007에서 median delta가 `+12.4 us`로 뒤집힌 반면 seed 2007/3007은
+각각 `-83.6 us`, `-39.7 us`였다. 따라서 global default를 0으로 낮추는
+결론보다는, DeepEP HT + 이 synthetic shape에서는 threshold 1024가 너무
+보수적이라는 결론이 더 안전하다.

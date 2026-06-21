@@ -13,12 +13,25 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_CSV = "deepep_ht_paired_ignore_20260620_raw.csv"
-SETTING_ORDER = ("baseline", "global_ignore", "local_id_ignore")
+SETTING_ORDER = (
+    "baseline",
+    "ignore_off",
+    "global_ignore",
+    "local_id_ignore",
+    "block_default",
+    "block_w1_64",
+    "block_w2_64",
+    "block_both_64",
+    "block_both_32",
+    "block_both_128",
+)
 INT_FIELDS = {
+    "cycle_order",
     "threshold",
     "input_seed_group",
+    "w1_block_m",
+    "w2_block_m",
     "cycle",
     "rank",
     "world_size",
@@ -126,6 +139,8 @@ def baseline_setting(rows: list[dict[str, Any]]) -> str:
         return "baseline"
     if "ignore_off" in settings:
         return "ignore_off"
+    if "block_default" in settings:
+        return "block_default"
     return settings[0]
 
 
@@ -242,9 +257,7 @@ def paired_deltas(
         if row_key(row, group_cols) == group_key
         and row["setting"] in (baseline, target)
     ]
-    by_key = {
-        (row_key(row, pair_cols), str(row["setting"])): row for row in filtered
-    }
+    by_key = {(row_key(row, pair_cols), str(row["setting"])): row for row in filtered}
     pair_keys = sorted({row_key(row, pair_cols) for row in filtered})
     deltas = []
     for pair_key in pair_keys:
@@ -341,9 +354,7 @@ def print_seed_table(rows: list[dict[str, Any]]) -> None:
         for target in targets:
             entries = paired_deltas(rows, target, group_key, group_cols)
             entries = [
-                entry
-                for entry in entries
-                if entry[0].get("input_seed_group") == seed
+                entry for entry in entries if entry[0].get("input_seed_group") == seed
             ]
             if not entries:
                 continue
@@ -405,9 +416,7 @@ def print_route_table(rows: list[dict[str, Any]]) -> None:
     group_cols = group_columns(rows)
     print("## Route Stats")
     print(
-        "| "
-        + " | ".join(group_cols)
-        + " | valid pairs r0/r1 | invalid pairs r0/r1 |"
+        "| " + " | ".join(group_cols) + " | valid pairs r0/r1 | invalid pairs r0/r1 |"
     )
     print("|" + "---|" * (len(group_cols) + 2))
     for group_key, subset in sorted(grouped_rows(rows, group_cols).items()):

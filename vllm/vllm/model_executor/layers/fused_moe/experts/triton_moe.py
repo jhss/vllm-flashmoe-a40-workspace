@@ -86,6 +86,12 @@ def _a100_moe_tuned_config(config: dict[str, int]) -> dict[str, int]:
     return tuned_config
 
 
+def _a100_moe_block_m_config(config: dict[str, int], block_m: int) -> dict[str, int]:
+    tuned_config = dict(config)
+    tuned_config["BLOCK_SIZE_M"] = block_m
+    return tuned_config
+
+
 def _is_a100_tuned_common_shape(
     *,
     hidden_states: torch.Tensor,
@@ -94,6 +100,7 @@ def _is_a100_tuned_common_shape(
     quant_config: FusedMoEQuantConfig,
     block_shape: list[int] | None,
     lora_enabled: bool,
+    min_tokens: int = 1024,
 ) -> bool:
     if not current_platform.is_cuda() or not current_platform.is_device_capability(80):
         return False
@@ -101,7 +108,7 @@ def _is_a100_tuned_common_shape(
         return False
     if lora_enabled or block_shape is not None:
         return False
-    if top_k_num != 8 or num_tokens < 1024:
+    if top_k_num != 8 or num_tokens < min_tokens:
         return False
     return not (
         quant_config.use_fp8_w8a8
@@ -122,6 +129,24 @@ def _maybe_get_a100_w1_config(
     block_shape: list[int] | None,
     lora_enabled: bool,
 ) -> dict[str, int]:
+    block_m_override = envs.VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE
+    if (
+        block_m_override > 0
+        and _is_a100_tuned_common_shape(
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=quant_config,
+            block_shape=block_shape,
+            lora_enabled=lora_enabled,
+            min_tokens=0,
+        )
+        and w1.dim() == 3
+        and w1.shape[0] in (64, 128)
+        and tuple(w1.shape[1:]) == (1536, 2048)
+    ):
+        return _a100_moe_block_m_config(config, block_m_override)
+
     if not (
         envs.VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG
         or envs.VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS
@@ -156,6 +181,24 @@ def _maybe_get_a100_w2_config(
     block_shape: list[int] | None,
     lora_enabled: bool,
 ) -> dict[str, int]:
+    block_m_override = envs.VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE
+    if (
+        block_m_override > 0
+        and _is_a100_tuned_common_shape(
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=quant_config,
+            block_shape=block_shape,
+            lora_enabled=lora_enabled,
+            min_tokens=0,
+        )
+        and w2.dim() == 3
+        and w2.shape[0] in (64, 128)
+        and tuple(w2.shape[1:]) == (2048, 768)
+    ):
+        return _a100_moe_block_m_config(config, block_m_override)
+
     if not (
         envs.VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG
         or envs.VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS
@@ -282,9 +325,14 @@ def _use_a100_bf16_w2_token_major_reduce_kernel(
         or quant_config.use_int4_w4a16
     ):
         return False
-    return w2.dim() == 3 and w2.shape[0] == 128 and tuple(w2.shape[1:]) == (
-        2048,
-        768,
+    return (
+        w2.dim() == 3
+        and w2.shape[0] == 128
+        and tuple(w2.shape[1:])
+        == (
+            2048,
+            768,
+        )
     )
 
 
@@ -691,8 +739,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 assignment_cache[block_size_m] = cached_assignment
             return cached_assignment
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            _get_expert_assignment(config)
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _get_expert_assignment(
+            config
         )
 
         # LoRA w13: applied to intermediate_cache1 before activation. When

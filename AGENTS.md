@@ -105,86 +105,87 @@ Use this map when profiling vLLM MoE expert parallelism:
 
 ## Immediate Experiment Queue
 
-The current high-priority experiment is the DeepEP HT direct expert-assignment
-path, controlled by these opt-in flags:
+The current high-priority experiment is DeepEP HT generic
+`ignore-invalid` follow-up work. The A100 SXM paired runs in
+`vllm/benchmarks/results/a100_sxm_moe_ep_code_changes.md` show that forced
+generic `ignore-invalid` already wins at the smallest measured received-M
+ranges. The 3-seed balanced pilot found median wins from received-M 16 through
+254/255, so the defensible conclusion is that the break-even is below that
+range for this workload and the current 1024 threshold is too conservative. Do
+not change the global default to 0 without more backend and shape coverage.
 
-- `VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=1`: preserve DeepEP HT raw local expert IDs
-  and build the Triton MoE assignment schedule from DeepEP's per-local-expert
-  token counts instead of rerunning the generic global-ID alignment path.
-- `VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG=1`: enable extra validation for the
-  direct assignment path. Use this only for correctness/debug runs, not timing.
-- `VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1`: older local-ID remap path. Keep it as an
-  ablation against baseline and direct assignment.
+Relevant flags:
+
+- `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1`: opt into the generic EP
+  invalid-expert filtering path.
+- `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS=0`: force the path on
+  for DeepEP HT benchmark confirmation runs only.
+- `VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1` and
+  `VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=1`: keep these as ablations. They are not
+  the current default candidates.
 
 Run the following experiments in order:
 
-1. Correctness smoke tests:
-   - Run `vllm/tests/kernels/moe/test_deepep_ht_expert_assignment.py` on CUDA.
-   - Cover raw `-1` local IDs, out-of-range IDs with `expert_map`, empty
-     experts, skewed experts, and `BLOCK_SIZE_M` values used by W1 and W2.
-   - Compare direct assignment output against the generic assignment path for
-     balanced and skewed top-k distributions.
+1. Small-M break-even confirmation:
+   - Use DeepEP HT, top-k 8, the A100 BF16 synthetic shape from the report, and
+     input tokens `8,16,32,48,64,96,128`.
+   - Completed a 3-seed pilot with seeds `1007,2007,3007` and 4 balanced
+     cycles. All measured tokens had negative paired median deltas for forced
+     ON; received-M 16 was still faster.
+   - If more confidence is needed, extend to 5 seeds and keep the same 4
+     balanced cycles:
+     `OFF->ON`, `ON->OFF`, `ON->OFF`, `OFF->ON`.
+   - Runner:
+     `python benchmarks/results/run_deepep_ht_paired_matrix.py --mode break-even`.
+   - Record received tokens per rank, valid/invalid route pairs, activation
+     state per rank, critical-path latency, paired deltas, seed-level medians,
+     and positive transient outliers.
 
-2. Assignment-only microbenchmarks:
-   - Compare generic `moe_align_block_size` scheduling against direct DeepEP HT
-     scheduling.
-   - Sweep tokens `128,256,512,1024,2048,4096`, top-k `2,4,8`, local experts
-     `8,16,32`, and `BLOCK_SIZE_M` `16,32,64,128`.
-   - Include balanced routing, Zipf/skewed routing, empty experts, and high
-     invalid-slot ratios.
-   - Record assignment time, padded token count, padding overhead, invalid-slot
-     ratio, tokens-per-expert histogram, and whether W1/W2 reused a cached
-     schedule.
+2. Post-ignore `BLOCK_SIZE_M` matrix:
+   - Focus first on input tokens `256,320,384,448`, where the current config
+     jumps from `BLOCK_SIZE_M=64` to `128` and padded rows double.
+   - Compare forced `ignore-invalid` ON with current default config, W1-only
+     `BLOCK_M=64`, W2-only `BLOCK_M=64`, W1/W2 `BLOCK_M=64`, and W1/W2
+     `BLOCK_M=32`; expand to `32/64/128` if the first sweep is promising.
+   - Runner:
+     `python benchmarks/results/run_deepep_ht_paired_matrix.py --mode block-m-sweep`.
+   - Record W1 latency, activation latency, W2 latency, reduce latency, full
+     critical path, W1/W2 padded rows, W1/W2 block size, valid blocks, and
+     padding ratio.
 
-3. Full MoE kernel ablation on 2x A40:
-   - Use `vllm/benchmarks/kernels/benchmark_moe_ep_a40.py` for targeted shapes.
-   - Compare baseline, `VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS=1`, and
-     `VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT=1`.
-   - Keep debug validation off for timing.
-   - Measure prepare/permute, dispatch communication, expert GEMM, combine,
-     unpermute/reduce, and total forward time.
-   - Run both world size 1 and 2 when possible so local scheduling wins are not
-     confused with all-to-all effects.
+3. Routing-aware config selector:
+   - If smaller `BLOCK_SIZE_M` wins in the matrix, prototype selection based on
+     post-filter expert histograms:
+     `sum(ceil_div(expert_count[e], block_m) * block_m)`.
+   - Use candidates `32,64,128`, then apply a small GEMM-efficiency LUT instead
+     of choosing only by padded-row count.
+   - Keep the selector DeepEP HT/workload gated until skewed routing and other
+     EP backend measurements are available.
 
-4. A40 sweep:
-   - Use `vllm/benchmarks/kernels/sweep_moe_ep_a40.py` once the targeted
-     ablation identifies promising shapes.
-   - Store compact CSV or Markdown summaries under `vllm/benchmarks/results/`.
-   - Do not commit raw profiler traces or large intermediate artifacts.
+4. Better ignore activation policy:
+   - After the small-M run, compare a simple DeepEP HT threshold against a
+     saved-work estimate based on invalid route pairs and the number of GEMM
+     programs removed.
+   - Prefer a policy that distinguishes low-M/high-invalid workloads from
+     high-M/low-invalid workloads.
 
-5. Nsight Systems profile:
-   - Profile only the smallest set of shapes where the direct path changes
-     timing by more than noise.
-   - Check whether direct assignment removes scheduling work, exposes a new
-     synchronization, changes stream overlap, or simply moves the bottleneck to
-     dispatch/combine communication.
-   - Use Nsight Compute only for kernels proven hot by Nsight Systems.
-
-6. End-to-end serving sanity:
-   - Run one short reproducible serving benchmark with a MoE model that fits on
-     2x A40.
-   - Compare baseline vs direct assignment with the same prompts, batching,
-     DBO/CUDA graph settings, and all-to-all backend.
-   - Treat kernel-only wins as insufficient unless throughput or latency also
-     improves beyond run-to-run noise.
-
-7. A100 SXM verification:
-   - After the A40 scripts are short and reproducible, rerun the same baseline,
-     local-ID, and direct-assignment comparisons on A100 SXM/NVLink.
-   - Keep the feature gated unless it improves A100 end-to-end behavior or has a
-     clearly documented negative result.
+5. Skew and correctness coverage:
+   - Test uniform, moderately skewed, hot-expert, empty-expert, and real router
+     trace distributions.
+   - Add a 2-rank full-output correctness comparison for OFF vs ON before any
+     default change.
 
 Decision rules:
 
-- Keep the direct assignment path only if correctness passes and full forward or
-  serving improves beyond noise on more than one relevant shape.
-- If the win appears only in assignment microbenchmarks, document the negative
-  end-to-end result and stop expanding the optimization.
-- If the win is A40 PCIe-specific and disappears on A100 SXM, keep the path
-  benchmark-only or disable it by default.
+- Keep `ignore-invalid` enabled by env override for DeepEP HT experiments until
+  small-M, skewed-routing, and correctness confirmation are complete.
+- Promote a DeepEP HT-specific default only if full forward or serving improves
+  beyond noise across relevant shapes and routing distributions.
+- Consider a generic EP default only after other all-to-all backends and model
+  shapes have measured coverage.
 - Record commit hash, hardware topology, CUDA/driver/PyTorch/vLLM versions,
-  exact commands, environment variables, warmup/iteration counts, and median
-  timing for every reported result.
+  exact commands, environment variables, warmup/iteration counts, paired
+  medians, and win counts for every reported result.
 
 ## Success Criteria
 

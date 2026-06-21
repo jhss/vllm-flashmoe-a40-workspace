@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     VLLM_MOE_TRITON_TOPK8_SUM: bool = False
     VLLM_MOE_TRITON_TOPK8_SUM_MIN_TOKENS: int = 256
     VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG: bool = False
+    VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE: int = 0
     VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS: bool = False
     VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE: bool = False
     VLLM_MOE_A100_BF16_W2_TOKEN_MAJOR_REDUCE_MAX_TOKENS: int = 1
@@ -186,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_MOE_TRITON_W2_REDUCE_FUSION: bool = False
     VLLM_MOE_TRITON_W2_REDUCE_FUSION_MIN_TOKENS: int = 256
     VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG: bool = False
+    VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE: int = 0
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -1432,6 +1434,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG": lambda: bool(
         int(os.getenv("VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG", "0"))
     ),
+    "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": lambda: int(
+        os.getenv("VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE", "0")
+    ),
     # Use a narrow A100/SM80 BF16 MoE Triton kernel-body fork for W1/W13
     # and W2 on the benchmarked Mixtral-like shape.
     "VLLM_MOE_A100_BF16_SPECIALIZED_KERNELS": lambda: bool(
@@ -1472,6 +1477,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mixtral-like shape E=128, hidden=2048, intermediate=768, top-k=8.
     "VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG": lambda: bool(
         int(os.getenv("VLLM_MOE_TRITON_W2_A100_TUNED_CONFIG", "0"))
+    ),
+    "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": lambda: int(
+        os.getenv("VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE", "0")
     ),
     # Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs.
     "VLLM_USE_DEEP_GEMM_E8M0": lambda: bool(
@@ -1616,10 +1624,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
     ),
     # Enforce function parameter schemas in structural-tag based tool calling.
-    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: os.getenv(
-        "VLLM_ENFORCE_STRICT_TOOL_CALLING", "True"
-    ).lower()
-    in ("true", "1"),
+    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
+        os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
+    ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
@@ -1773,9 +1780,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")
     ),
     # Number of SMs to use for DeepEP high-throughput kernels.
-    "VLLM_DEEPEP_HT_NUM_SMS": lambda: int(
-        os.getenv("VLLM_DEEPEP_HT_NUM_SMS", "20")
-    ),
+    "VLLM_DEEPEP_HT_NUM_SMS": lambda: int(os.getenv("VLLM_DEEPEP_HT_NUM_SMS", "20")),
     # Use a benchmark-gated Triton kernel to remap DeepEP HT local top-k ids
     # to vLLM's global expert id space in-place.
     "VLLM_DEEPEP_HT_TRITON_TOPK_REMAP": lambda: bool(
