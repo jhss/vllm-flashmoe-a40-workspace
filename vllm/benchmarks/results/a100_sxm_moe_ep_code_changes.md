@@ -2935,3 +2935,84 @@ seed 1007에서 median delta가 `+12.4 us`로 뒤집힌 반면 seed 2007/3007은
 각각 `-83.6 us`, `-39.7 us`였다. 따라서 global default를 0으로 낮추는
 결론보다는, DeepEP HT + 이 synthetic shape에서는 threshold 1024가 너무
 보수적이라는 결론이 더 안전하다.
+
+## 21. Lazy BLOCK_M assignment and 54-run screening
+
+Section 20의 BLOCK_M smoke 이후 `TritonExperts.apply()` 흐름을 다시 봤다.
+기존 코드는 먼저 기본 `config`로 expert assignment를 만든 뒤 W1/W2 override
+config assignment를 다시 만들었다. 따라서 `both_32` 같은 override는 실제로
+W1/W2에서 쓰지 않는 `BLOCK_M=128` assignment 비용까지 포함해 측정될 수
+있었다.
+
+이를 W1/W2 config 선택 후 필요한 assignment만 lazy하게 생성하도록 바꿨다.
+같은 `BLOCK_M`은 기존처럼 cache를 공유하므로 `both_32`와 `both_64`에서는
+W1/W2가 같은 assignment를 재사용한다.
+
+Lazy assignment smoke:
+
+```text
+benchmarks/results/deepep_ht_block_m_screening_20260621_lazy_assignment_smoke_raw.csv
+```
+
+Representative rank0 assignment stats:
+
+```text
+block_default: 0:m128:p8192:b64/0:sr3.19:vr3.19
+block_both_64: 0:m64:p4096:b64/0:sr1.59:vr1.59
+block_both_32: 0:m32:p3872:b121/0:sr1.51:vr1.51
+```
+
+이제 override 설정에서 불필요한 M128 assignment가 보이지 않는다.
+
+54-run screening:
+
+```text
+benchmarks/results/deepep_ht_block_m_screening_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_block_m_screening_20260621_3seed_summary.md
+```
+
+Run shape:
+
+```text
+tokens:       320, 448
+settings:     block_default, block_both_64, block_both_32
+input seeds:  1007, 2007, 3007
+cycles:       3-way Latin square
+warmup/iters: 20 / 100
+rows:         54 measurements, 36 paired comparisons
+```
+
+Cycle order:
+
+```text
+cycle 1: default -> both_64 -> both_32
+cycle 2: both_64 -> both_32 -> default
+cycle 3: both_32 -> default -> both_64
+```
+
+Paired critical-path delta, `setting - block_default`:
+
+```text
+tokens  setting        recv-M median  median delta  pair pct  wins
+320     block_both_32  638            -124.7 us     -7.74%    9/9
+320     block_both_64  638            -145.7 us     -8.91%    9/9
+448     block_both_32  892            -93.4 us      -5.69%    9/9
+448     block_both_64  892            -146.1 us     -8.80%    9/9
+```
+
+판정 기준이었던 `>=2% median improvement`, `>=7/9 wins`, `한 token size에서
+>=3%`를 모두 넉넉히 넘었다. 특히 `both_64`가 320/448 양쪽에서
+`both_32`보다 더 빠르다. 즉 단순히 padded rows를 최소화하는 것보다 GEMM
+efficiency까지 같이 봐야 한다.
+
+다음 실험은 full 400-run sweep이 아니라 W1/W2 기여 분리다.
+
+```text
+tokens:   320, 448
+settings: block_default, block_w1_64, block_w2_64, block_both_64
+seeds:    1007, 2007, 3007
+cycles:   4
+```
+
+여기서 W1/W2 중 어느 쪽의 `BLOCK_M=64`가 실제 이득을 만드는지 확인한 뒤,
+winner만 256/320/384/448 범위에서 5-seed final validation으로 확장한다.

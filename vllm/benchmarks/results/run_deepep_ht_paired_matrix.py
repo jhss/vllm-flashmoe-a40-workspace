@@ -20,7 +20,9 @@ from pathlib import Path
 
 DEFAULT_BREAK_EVEN_TOKENS = [8, 16, 32, 48, 64, 96, 128]
 DEFAULT_BLOCK_M_TOKENS = [256, 320, 384, 448]
+DEFAULT_BLOCK_M_SCREENING_TOKENS = [320, 448]
 DEFAULT_INPUT_SEEDS = [1007, 2007, 3007, 4007, 5007]
+DEFAULT_SCREENING_INPUT_SEEDS = [1007, 2007, 3007]
 DEFAULT_RESULT_DIR = Path(__file__).resolve().parent
 
 
@@ -37,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["break-even", "block-m-sweep"],
+        choices=["break-even", "block-m-sweep", "block-m-screening"],
         default="break-even",
     )
     parser.add_argument("--output", type=Path)
@@ -45,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--append", action="store_true")
     parser.add_argument("--tokens", type=int, nargs="+")
     parser.add_argument("--input-seed-bases", type=int, nargs="+")
-    parser.add_argument("--cycles", type=int, default=4)
+    parser.add_argument("--cycles", type=int)
     parser.add_argument("--thresholds", type=int, nargs="+", default=[0])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
@@ -61,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--block-m-settings",
         nargs="+",
-        default=["default", "w1_64", "w2_64", "both_64", "both_32"],
+        default=None,
         help=(
             "Block-M sweep settings. Supported values: default, w1_32, "
             "w1_64, w1_128, w2_32, w2_64, w2_128, both_32, both_64, "
@@ -79,9 +81,37 @@ def parse_args() -> argparse.Namespace:
 def default_output(mode: str) -> Path:
     if mode == "break-even":
         name = "deepep_ht_break_even_sub254_20260621_raw.csv"
+    elif mode == "block-m-screening":
+        name = "deepep_ht_block_m_screening_20260621_raw.csv"
     else:
         name = "deepep_ht_block_m_sweep_20260621_raw.csv"
     return DEFAULT_RESULT_DIR / name
+
+
+def default_tokens(mode: str) -> list[int]:
+    if mode == "break-even":
+        return DEFAULT_BREAK_EVEN_TOKENS
+    if mode == "block-m-screening":
+        return DEFAULT_BLOCK_M_SCREENING_TOKENS
+    return DEFAULT_BLOCK_M_TOKENS
+
+
+def default_input_seeds(mode: str) -> list[int]:
+    if mode == "block-m-screening":
+        return DEFAULT_SCREENING_INPUT_SEEDS
+    return DEFAULT_INPUT_SEEDS
+
+
+def default_cycles(mode: str) -> int:
+    if mode == "block-m-screening":
+        return 3
+    return 4
+
+
+def default_block_m_setting_names(mode: str) -> list[str]:
+    if mode == "block-m-screening":
+        return ["default", "both_64", "both_32"]
+    return ["default", "w1_64", "w2_64", "both_64", "both_32"]
 
 
 def common_env(args: argparse.Namespace) -> dict[str, str]:
@@ -169,9 +199,8 @@ def cycle_settings(settings: list[Setting], cycle: int) -> list[Setting]:
             (settings[0], settings[1]),
         )
         return list(pattern[(cycle - 1) % len(pattern)])
-    if cycle % 2 == 0:
-        return list(reversed(settings))
-    return list(settings)
+    shift = (cycle - 1) % len(settings)
+    return list(settings[shift:] + settings[:shift])
 
 
 def benchmark_command(args: argparse.Namespace, tokens: int, input_seed_base: int):
@@ -268,19 +297,19 @@ def main() -> None:
     )
     tokens_list = args.tokens
     if tokens_list is None:
-        tokens_list = (
-            DEFAULT_BREAK_EVEN_TOKENS
-            if args.mode == "break-even"
-            else DEFAULT_BLOCK_M_TOKENS
-        )
-    input_seed_bases = args.input_seed_bases or DEFAULT_INPUT_SEEDS
+        tokens_list = default_tokens(args.mode)
+    input_seed_bases = args.input_seed_bases or default_input_seeds(args.mode)
+    cycles = args.cycles or default_cycles(args.mode)
+    block_m_setting_names = args.block_m_settings or default_block_m_setting_names(
+        args.mode
+    )
 
     if args.mode == "break-even":
         settings_groups = [
             break_even_settings(threshold) for threshold in args.thresholds
         ]
     else:
-        settings_groups = [block_m_settings(args.block_m_settings)]
+        settings_groups = [block_m_settings(block_m_setting_names)]
 
     common = common_env(args)
     fieldnames: list[str] | None = None
@@ -289,7 +318,7 @@ def main() -> None:
 
     for settings in settings_groups:
         for input_seed_base in input_seed_bases:
-            for cycle in range(1, args.cycles + 1):
+            for cycle in range(1, cycles + 1):
                 for tokens in tokens_list:
                     cycle_order = cycle_settings(settings, cycle)
                     for order_idx, setting in enumerate(cycle_order):

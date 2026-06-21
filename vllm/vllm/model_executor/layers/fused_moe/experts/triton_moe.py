@@ -739,10 +739,6 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 assignment_cache[block_size_m] = cached_assignment
             return cached_assignment
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = _get_expert_assignment(
-            config
-        )
-
         # LoRA w13: applied to intermediate_cache1 before activation. When
         # the LoRA layer requested a dual-stream schedule, we run base w13
         # GEMM on the default stream and the LoRA fast-path on aux_stream;
@@ -927,6 +923,19 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # sorted_token_ids_lora computed above. Same dual-stream pattern as
         # the w13 pair: base GEMM on default stream, LoRA delta on aux,
         # join via .add_() into intermediate_cache3.
+        w2_config = _maybe_get_a100_w2_config(
+            config,
+            w2=w2,
+            hidden_states=hidden_states,
+            num_tokens=num_tokens,
+            top_k_num=top_k_num,
+            quant_config=self.quant_config,
+            block_shape=self.block_shape,
+            lora_enabled=lora_context is not None,
+        )
+        w2_sorted_token_ids, w2_expert_ids, w2_num_tokens_post_padded = (
+            _get_expert_assignment(w2_config)
+        )
         fuse_w2_reduce = (
             envs.VLLM_MOE_TRITON_W2_REDUCE_FUSION
             and not ep_ignore_invalid_experts
@@ -938,7 +947,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             and output.is_cuda
             and output.is_contiguous()
             and topk_weights.is_contiguous()
-            and sorted_token_ids is not None
+            and w2_sorted_token_ids is not None
             and self.w2_bias is None
             and not self.quant_config.use_fp8_w8a8
             and not self.quant_config.use_int8_w8a8
@@ -954,19 +963,6 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 )
             w2_reduce_output.zero_()
 
-        w2_config = _maybe_get_a100_w2_config(
-            config,
-            w2=w2,
-            hidden_states=hidden_states,
-            num_tokens=num_tokens,
-            top_k_num=top_k_num,
-            quant_config=self.quant_config,
-            block_shape=self.block_shape,
-            lora_enabled=lora_context is not None,
-        )
-        w2_sorted_token_ids, w2_expert_ids, w2_num_tokens_post_padded = (
-            _get_expert_assignment(w2_config)
-        )
         use_a100_bf16_w2_kernel = _use_a100_bf16_w2_kernel(
             w2=w2,
             hidden_states=hidden_states,

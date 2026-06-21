@@ -20,10 +20,14 @@ SETTING_ORDER = (
     "global_ignore",
     "local_id_ignore",
     "block_default",
+    "block_w1_32",
     "block_w1_64",
+    "block_w1_128",
+    "block_w2_32",
     "block_w2_64",
-    "block_both_64",
+    "block_w2_128",
     "block_both_32",
+    "block_both_64",
     "block_both_128",
 )
 INT_FIELDS = {
