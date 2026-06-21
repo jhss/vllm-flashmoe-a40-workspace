@@ -1,0 +1,272 @@
+{
+  "assignment_stats": [
+    {
+      "fixed_capacity": false,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": false,
+      "local_stats": {
+        "assignment_stats": "0:m128:p10752:b64/20:sr2.11:vr4.09",
+        "ep_ignore_enabled": false,
+        "ep_ignore_num_tokens": 638,
+        "invalid_route_pairs": 2476,
+        "received_tokens": 638,
+        "valid_route_pairs": 2628
+      },
+      "rank": 0,
+      "setting": "original",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:sr1.56:vr1.56",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 638,
+        "invalid_route_pairs": 2476,
+        "received_tokens": 638,
+        "valid_route_pairs": 2628
+      },
+      "rank": 0,
+      "setting": "compute_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": true,
+      "fixed_capacity_raw_local_ids": false,
+      "ignore_invalid_experts": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 0,
+      "setting": "fixed_remap_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": true,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 0,
+      "setting": "final_raw_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": false,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": false,
+      "local_stats": {
+        "assignment_stats": "0:m128:p10880:b64/21:sr2.14:vr4.37",
+        "ep_ignore_enabled": false,
+        "ep_ignore_num_tokens": 635,
+        "invalid_route_pairs": 2588,
+        "received_tokens": 635,
+        "valid_route_pairs": 2492
+      },
+      "rank": 1,
+      "setting": "original",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:sr1.64:vr1.64",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 635,
+        "invalid_route_pairs": 2588,
+        "received_tokens": 635,
+        "valid_route_pairs": 2492
+      },
+      "rank": 1,
+      "setting": "compute_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": true,
+      "fixed_capacity_raw_local_ids": false,
+      "ignore_invalid_experts": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 1,
+      "setting": "fixed_remap_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": true,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": true,
+      "local_stats": {
+        "assignment_stats": "0:m64:p4096:b64/0:srna:vrna",
+        "ep_ignore_enabled": true,
+        "ep_ignore_num_tokens": 640,
+        "invalid_route_pairs": null,
+        "received_tokens": 640,
+        "valid_route_pairs": null
+      },
+      "rank": 1,
+      "setting": "final_raw_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    }
+  ],
+  "atol": 0.01,
+  "backend": "deepep_high_throughput",
+  "fixed_capacity_num_worst_tokens": 0,
+  "hidden_size": 2048,
+  "input_seed_base": 1007,
+  "intermediate_size": 768,
+  "metrics": [
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.001953125,
+      "mean_abs_error": 6.998488970566541e-05,
+      "rank": 0,
+      "reference": "original",
+      "relative_l2_error": 0.003737409831956029,
+      "rtol": 0.016,
+      "setting": "compute_both_64",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.001953125,
+      "mean_abs_error": 6.998488970566541e-05,
+      "rank": 0,
+      "reference": "original",
+      "relative_l2_error": 0.003737409831956029,
+      "rtol": 0.016,
+      "setting": "fixed_remap_both_64",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.001953125,
+      "mean_abs_error": 6.998488970566541e-05,
+      "rank": 0,
+      "reference": "original",
+      "relative_l2_error": 0.003737409831956029,
+      "rtol": 0.016,
+      "setting": "final_raw_both_64",
+      "tokens": 128
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.001953125,
+      "mean_abs_error": 6.988451787037775e-05,
+      "rank": 1,
+      "reference": "original",
+      "relative_l2_error": 0.0037505219224840403,
+      "rtol": 0.016,
+      "setting": "compute_both_64",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.001953125,
+      "mean_abs_error": 6.988451787037775e-05,
+      "rank": 1,
+      "reference": "original",
+      "relative_l2_error": 0.0037505219224840403,
+      "rtol": 0.016,
+      "setting": "fixed_remap_both_64",
+      "tokens": 512
+    },
+    {
+      "assert_close": true,
+      "assert_close_error": null,
+      "atol": 0.01,
+      "max_abs_error": 0.001953125,
+      "mean_abs_error": 6.988451787037775e-05,
+      "rank": 1,
+      "reference": "original",
+      "relative_l2_error": 0.0037505219224840403,
+      "rtol": 0.016,
+      "setting": "final_raw_both_64",
+      "tokens": 512
+    }
+  ],
+  "num_experts": 128,
+  "rank_distinct_inputs": true,
+  "rank_tokens": [
+    128,
+    512
+  ],
+  "route_target_rank": -1,
+  "rtol": 0.016,
+  "settings": [
+    {
+      "fixed_capacity": false,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": false,
+      "name": "original",
+      "w1_block_m": 0,
+      "w2_block_m": 0
+    },
+    {
+      "fixed_capacity": false,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": true,
+      "name": "compute_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": true,
+      "fixed_capacity_raw_local_ids": false,
+      "ignore_invalid_experts": true,
+      "name": "fixed_remap_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    },
+    {
+      "fixed_capacity": true,
+      "fixed_capacity_raw_local_ids": true,
+      "ignore_invalid_experts": true,
+      "name": "final_raw_both_64",
+      "w1_block_m": 64,
+      "w2_block_m": 64
+    }
+  ],
+  "tokens": 320,
+  "top_k": 8,
+  "weight_seed": 7,
+  "world_size": 2
+}

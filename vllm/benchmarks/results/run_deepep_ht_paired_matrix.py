@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
             "block-m-sweep",
             "block-m-screening",
             "block-m-combined-ablation",
+            "final-cumulative-ablation",
         ],
         default="break-even",
     )
@@ -73,7 +74,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Block-M sweep settings. Supported values: default, w1_32, "
             "w1_64, w1_128, w2_32, w2_64, w2_128, both_32, both_64, "
-            "both_128, fixed_both_64."
+            "both_128, fixed_both_64, fixed_remap_both_64, "
+            "fixed_raw_both_64."
         ),
     )
     parser.add_argument("--section-profile-iters", type=int, default=0)
@@ -91,6 +93,8 @@ def default_output(mode: str) -> Path:
         name = "deepep_ht_block_m_screening_20260621_raw.csv"
     elif mode == "block-m-combined-ablation":
         name = "deepep_ht_block_m_combined_ablation_20260621_raw.csv"
+    elif mode == "final-cumulative-ablation":
+        name = "deepep_ht_final_cumulative_ablation_20260621_raw.csv"
     else:
         name = "deepep_ht_block_m_sweep_20260621_raw.csv"
     return DEFAULT_RESULT_DIR / name
@@ -101,13 +105,17 @@ def default_tokens(mode: str) -> list[int]:
         return DEFAULT_BREAK_EVEN_TOKENS
     if mode == "block-m-screening":
         return DEFAULT_BLOCK_M_SCREENING_TOKENS
-    if mode == "block-m-combined-ablation":
+    if mode in ("block-m-combined-ablation", "final-cumulative-ablation"):
         return DEFAULT_BLOCK_M_COMBINED_ABLATION_TOKENS
     return DEFAULT_BLOCK_M_TOKENS
 
 
 def default_input_seeds(mode: str) -> list[int]:
-    if mode in ("block-m-screening", "block-m-combined-ablation"):
+    if mode in (
+        "block-m-screening",
+        "block-m-combined-ablation",
+        "final-cumulative-ablation",
+    ):
         return DEFAULT_SCREENING_INPUT_SEEDS
     return DEFAULT_INPUT_SEEDS
 
@@ -115,6 +123,8 @@ def default_input_seeds(mode: str) -> list[int]:
 def default_cycles(mode: str) -> int:
     if mode in ("block-m-screening", "block-m-combined-ablation"):
         return 3
+    if mode == "final-cumulative-ablation":
+        return 4
     return 4
 
 
@@ -246,6 +256,59 @@ def block_m_combined_ablation_settings() -> list[Setting]:
                 "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
                 "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": "64",
                 "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": "64",
+            },
+            threshold=0,
+            w1_block_m=64,
+            w2_block_m=64,
+        ),
+    ]
+
+
+def final_cumulative_ablation_settings() -> list[Setting]:
+    return [
+        Setting(
+            name="original",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "0",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+            },
+            threshold=0,
+        ),
+        Setting(
+            name="compute_both_64",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "1",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+                "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": "64",
+                "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": "64",
+            },
+            threshold=0,
+            w1_block_m=64,
+            w2_block_m=64,
+        ),
+        Setting(
+            name="fixed_remap_both_64",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "1",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+                "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": "64",
+                "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": "64",
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH": "1",
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS": "0",
+            },
+            threshold=0,
+            w1_block_m=64,
+            w2_block_m=64,
+        ),
+        Setting(
+            name="final_raw_both_64",
+            env={
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS": "1",
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS": "0",
+                "VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE": "64",
+                "VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE": "64",
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH": "1",
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS": "1",
             },
             threshold=0,
             w1_block_m=64,
@@ -392,6 +455,8 @@ def main() -> None:
         ]
     elif args.mode == "block-m-combined-ablation":
         settings_groups = [block_m_combined_ablation_settings()]
+    elif args.mode == "final-cumulative-ablation":
+        settings_groups = [final_cumulative_ablation_settings()]
     else:
         settings_groups = [block_m_settings(block_m_setting_names)]
 

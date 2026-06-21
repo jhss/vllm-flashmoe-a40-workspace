@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check DeepEP HT BLOCK_M override output closeness.
+"""Check DeepEP HT final ablation output closeness.
 
 The benchmark runner measures latency in separate processes, which is the
 cleanest way to avoid cross-setting state. This smoke instead keeps one layer
-and one synthetic input alive per rank, runs default/M64/M32 settings, and
+and one synthetic input alive per rank, runs the final ablation settings, and
 compares their final MoE outputs with BF16 tolerances.
 """
 
@@ -44,7 +44,9 @@ class CorrectnessSetting:
     name: str
     w1_block_m: int
     w2_block_m: int
+    ignore_invalid_experts: bool
     fixed_capacity: bool = False
+    fixed_capacity_raw_local_ids: bool = True
 
 
 @dataclass
@@ -63,10 +65,24 @@ class CorrectnessMetric:
 
 
 SETTINGS = (
-    CorrectnessSetting("block_default", 0, 0),
-    CorrectnessSetting("block_both_64", 64, 64),
-    CorrectnessSetting("block_both_32", 32, 32),
-    CorrectnessSetting("fixed_both_64", 64, 64, fixed_capacity=True),
+    CorrectnessSetting("original", 0, 0, ignore_invalid_experts=False),
+    CorrectnessSetting("compute_both_64", 64, 64, ignore_invalid_experts=True),
+    CorrectnessSetting(
+        "fixed_remap_both_64",
+        64,
+        64,
+        ignore_invalid_experts=True,
+        fixed_capacity=True,
+        fixed_capacity_raw_local_ids=False,
+    ),
+    CorrectnessSetting(
+        "final_raw_both_64",
+        64,
+        64,
+        ignore_invalid_experts=True,
+        fixed_capacity=True,
+        fixed_capacity_raw_local_ids=True,
+    ),
 )
 
 
@@ -157,10 +173,17 @@ def clear_env_cache() -> None:
 
 
 def configure_setting(setting: CorrectnessSetting, args: argparse.Namespace) -> None:
+    os.environ["VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS"] = (
+        "1" if setting.ignore_invalid_experts else "0"
+    )
+    os.environ["VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS"] = "0"
     os.environ["VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE"] = str(setting.w1_block_m)
     os.environ["VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE"] = str(setting.w2_block_m)
     os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH"] = (
         "1" if setting.fixed_capacity else "0"
+    )
+    os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS"] = (
+        "1" if setting.fixed_capacity_raw_local_ids else "0"
     )
     os.environ["VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS"] = (
         str(args.fixed_capacity_num_worst_tokens or sum(tokens_across_dp(args)))
@@ -293,7 +316,11 @@ def run_worker(
                     "setting": setting.name,
                     "w1_block_m": setting.w1_block_m,
                     "w2_block_m": setting.w2_block_m,
+                    "ignore_invalid_experts": setting.ignore_invalid_experts,
                     "fixed_capacity": setting.fixed_capacity,
+                    "fixed_capacity_raw_local_ids": (
+                        setting.fixed_capacity_raw_local_ids
+                    ),
                     "local_stats": stats_by_rank[rank],
                 }
             )

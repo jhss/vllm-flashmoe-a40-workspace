@@ -18,6 +18,9 @@ SETTING_ORDER = (
     "original",
     "filtering",
     "final_both_64",
+    "compute_both_64",
+    "fixed_remap_both_64",
+    "final_raw_both_64",
     "baseline",
     "ignore_off",
     "global_ignore",
@@ -260,18 +263,27 @@ def paired_deltas(
     group_cols: list[str],
 ) -> list[tuple[dict[str, Any], dict[str, Any], float, float]]:
     baseline = baseline_setting(rows)
+    return paired_deltas_between(rows, baseline, target, group_key, group_cols)
+
+
+def paired_deltas_between(
+    rows: list[dict[str, Any]],
+    source: str,
+    target: str,
+    group_key: tuple[Any, ...],
+    group_cols: list[str],
+) -> list[tuple[dict[str, Any], dict[str, Any], float, float]]:
     pair_cols = pair_columns(rows)
     filtered = [
         row
         for row in rows
-        if row_key(row, group_cols) == group_key
-        and row["setting"] in (baseline, target)
+        if row_key(row, group_cols) == group_key and row["setting"] in (source, target)
     ]
     by_key = {(row_key(row, pair_cols), str(row["setting"])): row for row in filtered}
     pair_keys = sorted({row_key(row, pair_cols) for row in filtered})
     deltas = []
     for pair_key in pair_keys:
-        base_row = by_key.get((pair_key, baseline))
+        base_row = by_key.get((pair_key, source))
         target_row = by_key.get((pair_key, target))
         if base_row is None or target_row is None:
             continue
@@ -337,6 +349,54 @@ def print_paired_table(rows: list[dict[str, Any]]) -> None:
                     f"{iqr(deltas):.1f}",
                     f"{min(deltas):+.1f}",
                     f"{max(deltas):+.1f}",
+                    f"{sum(delta < 0 for delta in deltas)}/{len(deltas)}",
+                ]
+            )
+            print("| " + " | ".join(cells) + " |")
+    print()
+
+
+def print_stepwise_table(rows: list[dict[str, Any]]) -> None:
+    present = {str(row["setting"]) for row in rows}
+    steps = [
+        ("original", "compute_both_64", "Original -> Compute"),
+        ("compute_both_64", "fixed_remap_both_64", "Compute -> Fixed remap"),
+        ("fixed_remap_both_64", "final_raw_both_64", "Fixed remap -> Raw local"),
+        ("original", "final_raw_both_64", "Original -> Final"),
+    ]
+    steps = [step for step in steps if step[0] in present and step[1] in present]
+    if not steps:
+        return
+
+    group_cols = group_columns(rows)
+    print("## Stepwise Delta")
+    print(
+        "| "
+        + " | ".join(group_cols)
+        + " | step | source median | target median | median delta | "
+        "delta/source median | median pair pct | wins |"
+    )
+    print("|" + "---|" * (len(group_cols) + 8))
+    for group_key in sorted(grouped_rows(rows, group_cols)):
+        for source, target, label in steps:
+            entries = paired_deltas_between(rows, source, target, group_key, group_cols)
+            if not entries:
+                continue
+            source_vals = [float(entry[0]["critical_path_us"]) for entry in entries]
+            target_vals = [float(entry[1]["critical_path_us"]) for entry in entries]
+            deltas = [entry[2] for entry in entries]
+            pcts = [entry[3] for entry in entries]
+            source_median = median(source_vals)
+            delta_median = median(deltas)
+            cells = [str(value) for value in group_key]
+            cells.extend(
+                [
+                    label,
+                    f"{source_median:.1f}",
+                    f"{median(target_vals):.1f}",
+                    f"{delta_median:+.1f}",
+                    f"{delta_median / source_median * 100.0:+.2f}%",
+                    f"{median(pcts):+.2f}%",
                     f"{sum(delta < 0 for delta in deltas)}/{len(deltas)}",
                 ]
             )
@@ -502,6 +562,7 @@ def main() -> None:
     validate_rows(rows)
     print_absolute_table(rows)
     print_paired_table(rows)
+    print_stepwise_table(rows)
     print_seed_table(rows)
     print_ignore_table(rows)
     print_route_table(rows)

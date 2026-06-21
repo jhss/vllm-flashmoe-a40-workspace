@@ -3501,3 +3501,104 @@ Result:
 
 The paired analyzer also now prints `n/a` for route stats when fixed-capacity
 intentionally omits CPU route-pair counts, instead of failing on `None`.
+
+## 27. Final cumulative ablation and original-vs-final correctness
+
+The final cumulative ablation now compares the four portfolio settings in one
+same-session run:
+
+```text
+A original:            ignore-invalid off, default BLOCK_M, dynamic receive
+B compute_both_64:     ignore-invalid on, W1/W2 BLOCK_M=64, dynamic receive
+C fixed_remap_both_64: ignore-invalid on, W1/W2 BLOCK_M=64, fixed receive,
+                       old remap path
+D final_raw_both_64:   ignore-invalid on, W1/W2 BLOCK_M=64, fixed receive,
+                       raw local expert IDs and raw -1 invalid rows
+```
+
+Run:
+
+```text
+benchmarks/results/deepep_ht_final_cumulative_ablation_20260621_3seed_commands.log
+benchmarks/results/deepep_ht_final_cumulative_ablation_20260621_3seed_raw.csv
+benchmarks/results/deepep_ht_final_cumulative_ablation_20260621_3seed_summary.md
+```
+
+Shape:
+
+```text
+tokens:       320, 448
+settings:     original, compute_both_64, fixed_remap_both_64, final_raw_both_64
+input seeds:  1007, 2007, 3007
+cycles:       4 cyclic orders
+warmup/iters: 20 / 100
+rows:         96 measurements, 24 paired comparisons per step
+```
+
+Absolute medians:
+
+```text
+tokens  original  compute  fixed-remap  final-raw
+320     1728.0 us 1515.3 us 1545.0 us   1461.3 us
+448     1748.7 us 1570.0 us 1596.3 us   1502.4 us
+```
+
+Stepwise paired medians:
+
+```text
+tokens  step                       delta       pct       wins
+320     Original -> Compute        -214.4 us   -12.41%   11/12
+320     Compute -> Fixed remap     +32.2 us    +2.12%    2/12
+320     Fixed remap -> Raw local   -95.4 us    -6.17%    11/12
+320     Original -> Final          -268.0 us   -15.51%   12/12
+
+448     Original -> Compute        -180.9 us   -10.34%   11/12
+448     Compute -> Fixed remap     +36.2 us    +2.30%    4/12
+448     Fixed remap -> Raw local   -103.2 us   -6.47%    10/12
+448     Original -> Final          -248.7 us   -14.22%   12/12
+```
+
+The final same-session number to quote is therefore:
+
+```text
+tokens=320: original -> final_raw_both_64 = -15.51%
+tokens=448: original -> final_raw_both_64 = -14.22%
+```
+
+The important nuance is that fixed-capacity without raw-local alignment is not
+the final fast path in this session. The `fixed_remap_both_64` setting is
+slower than `compute_both_64` by about 2.1-2.3%, while raw-local alignment
+then recovers that cost and adds about 6.2-6.5% over fixed-remap. The final
+publishable result should be original vs final raw-local, plus this stepwise
+breakdown.
+
+Final correctness artifacts:
+
+```text
+benchmarks/results/deepep_ht_final_correctness_20260621_summary.md
+benchmarks/results/deepep_ht_final_correctness_tokens320_20260621.json
+benchmarks/results/deepep_ht_final_correctness_tokens448_20260621.json
+benchmarks/results/deepep_ht_final_correctness_rank128_512_20260621.json
+benchmarks/results/deepep_ht_final_correctness_rank128_512_target0_20260621.json
+benchmarks/results/deepep_ht_final_correctness_rank128_512_target1_20260621.json
+```
+
+These compare `compute_both_64`, `fixed_remap_both_64`, and
+`final_raw_both_64` against `original` in the same 2-rank layer instance.
+All cases passed `torch.testing.assert_close`:
+
+```text
+case                              max_abs_error  mean_abs_error  relative_l2
+tokens=320 balanced               0.00195312     7.05142e-05     0.00375014
+tokens=448 balanced               0.00195312     7.02225e-05     0.00375855
+rank_tokens=128/512 balanced      0.00195312     6.99849e-05     0.00375052
+rank_tokens=128/512 target_rank=0 0.00195312     9.02659e-05     0.00321721
+rank_tokens=128/512 target_rank=1 0.00195312     9.11606e-05     0.00321549
+```
+
+Full alignment regression:
+
+```text
+python -m pytest -q tests/kernels/moe/test_moe_align_block_size.py
+477 passed, 16 warnings
+```
