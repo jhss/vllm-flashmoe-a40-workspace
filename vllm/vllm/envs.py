@@ -1804,8 +1804,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEEPEP_HT_DIRECT_ASSIGNMENT_DEBUG", "0"))
     ),
     # Use DeepEP intranode dispatch with num_worst_tokens to avoid the
-    # receive-count CPU sync. Experimental; requires generic ignore-invalid
-    # handling so padded top-k rows (-1) are filtered downstream.
+    # receive-count CPU sync. Experimental; leaves receiver-local top-k ids
+    # and padded rows (-1) for downstream alignment to filter directly.
     "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH", "0"))
     ),

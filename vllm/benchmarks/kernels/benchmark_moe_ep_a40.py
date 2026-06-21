@@ -759,22 +759,23 @@ def _wrap_deepep_ht_receiver_details(
                 deepep_ht_module.envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS
                 or use_direct_assignment
             )
-            if not use_direct_assignment and use_local_expert_ids:
-                local_num_experts = len(expert_num_tokens_per_expert_list)
-                expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
-                    expert_topk_ids,
-                    local_num_experts,
-                    0,
-                )
-            elif not use_direct_assignment:
-                invalid_expert_id = (
-                    num_experts - 1 if self.rank_expert_offset == 0 else 0
-                )
-                expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
-                    expert_topk_ids,
-                    invalid_expert_id,
-                    self.rank_expert_offset,
-                )
+            if not fixed_capacity_dispatch:
+                if not use_direct_assignment and use_local_expert_ids:
+                    local_num_experts = len(expert_num_tokens_per_expert_list)
+                    expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
+                        expert_topk_ids,
+                        local_num_experts,
+                        0,
+                    )
+                elif not use_direct_assignment:
+                    invalid_expert_id = (
+                        num_experts - 1 if self.rank_expert_offset == 0 else 0
+                    )
+                    expert_topk_ids = deepep_ht_module.remap_deepep_ht_topk_ids(
+                        expert_topk_ids,
+                        invalid_expert_id,
+                        self.rank_expert_offset,
+                    )
 
         with profiler.section("deepep_receiver_metadata"):
             assignment_layout = (

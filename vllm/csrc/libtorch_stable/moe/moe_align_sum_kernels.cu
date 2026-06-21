@@ -126,7 +126,8 @@ __device__ void _moe_align_block_size(
 
   for (size_t i = tid; i < numel; i += stride) {
     int expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    if (static_cast<uint32_t>(expert_id) >=
+        static_cast<uint32_t>(num_experts)) {
       continue;
     }
     if (has_expert_map) {
@@ -227,6 +228,10 @@ __device__ void _moe_align_block_size_small_batch_expert(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    if (static_cast<uint32_t>(expert_id) >=
+        static_cast<uint32_t>(num_experts)) {
+      continue;
+    }
     if (has_expert_map) {
       expert_id = expert_map[expert_id];
       // filter invalid expert
@@ -276,6 +281,10 @@ __device__ void _moe_align_block_size_small_batch_expert(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    if (static_cast<uint32_t>(expert_id) >=
+        static_cast<uint32_t>(num_experts)) {
+      continue;
+    }
     if (has_expert_map) {
       expert_id = expert_map[expert_id];
       // filter invalid expert
@@ -303,7 +312,8 @@ __device__ void _count_and_sort_expert_tokens(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    if (static_cast<uint32_t>(expert_id) >=
+        static_cast<uint32_t>(num_experts)) {
       continue;
     }
 

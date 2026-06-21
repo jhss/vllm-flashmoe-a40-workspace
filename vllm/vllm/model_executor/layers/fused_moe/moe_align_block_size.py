@@ -38,11 +38,12 @@ def moe_align_block_size(
     - pad_sorted_ids: A flag indicating whether the sorted_token_ids length
         should be padded to a multiple of block_size,
     - ignore_invalid_experts: A flag indicating whether to ignore invalid
-        experts. When False, all expert_ids in topk_ids will participate in
-        counting and ranking, but invalid experts in expert_ids will be marked
-        as -1. When True, all invalid expert_ids in topk_ids will be ignored
-        and will not participate in counting or ranking, and there will be no
-        -1 in expert_ids.
+        experts through expert_map. Negative or out-of-range expert_ids in
+        topk_ids are always skipped. When False, mapped invalid experts
+        participate in counting and ranking, but invalid experts in expert_ids
+        will be marked as -1. When True, mapped invalid expert_ids in topk_ids
+        will be ignored and will not participate in counting or ranking, and
+        there will be no -1 in expert_ids.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according

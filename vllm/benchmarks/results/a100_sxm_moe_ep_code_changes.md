@@ -3312,3 +3312,91 @@ Next steps:
 3. Track route stats for fixed-capacity mode without CPU count list, likely by
    counting valid top-k rows on GPU or deriving from assignment stats.
 ```
+
+## 25. DeepEP HT fixed-capacity raw `-1` alignment
+
+Section 24 left one visible receiver cost: fixed-capacity still remapped DeepEP
+HT receiver-local top-k ids and padded `-1` rows into global/sentinel expert
+ids before generic alignment. This change removes that remap kernel for the
+fixed-capacity path.
+
+Implementation:
+
+```text
+DeepEP HT fixed-capacity receiver
+  keeps raw local expert ids and raw -1 padded/non-local slots
+
+expert assignment params
+  use local_num_experts plus a local identity expert_map
+
+CUDA moe_align_block_size
+  skips expert_id < 0 and expert_id >= num_experts before expert_map lookup
+```
+
+The local identity map is intentionally kept. It lets the existing
+ignore-invalid W2 reduction skip raw `-1` top-k slots without reintroducing a
+top-k remap kernel.
+
+Additional fixed-capacity guards:
+
+```text
+requires top_k=8
+requires VLLM_MOE_TRITON_W2_REDUCE_FUSION=0
+requires ignore-invalid min-tokens <= fixed capacity
+rejects apply_router_weight_on_input=True
+```
+
+Correctness:
+
+```text
+benchmarks/results/deepep_ht_raw_negative_correctness_tokens320_20260621.json
+benchmarks/results/deepep_ht_raw_negative_correctness_rank128_512_target1_20260621.json
+```
+
+Both balanced 320-token and asymmetric `rank0=128/rank1=512`,
+`route_target_rank=1` smokes matched `block_default` with `max_abs_error=0`,
+`mean_abs_error=0`, `relative_l2_error=0` for `fixed_both_64` on both ranks.
+
+Raw align CUDA smoke:
+
+```text
+topk = [[0, -1, 1, 64], [2, -2, 3, -1]]
+num_experts = 4
+post_pad = 16
+expert_ids = [0, 1, 2, 3]
+```
+
+Profile inputs:
+
+```text
+benchmarks/results/deepep_ht_raw_negative_profile_20260621_raw.csv
+benchmarks/results/deepep_ht_raw_negative_profile_20260621_summary.md
+benchmarks/results/deepep_ht_raw_negative_profile_20260621_direct_both64.rank*.json
+benchmarks/results/deepep_ht_raw_negative_profile_20260621_direct_fixed.rank*.json
+```
+
+Single-seed paired run, tokens=320, warmup/iters=10/50:
+
+```text
+block_both_64        critical path 1609.2 us
+block_fixed_both_64  critical path 1446.5 us
+delta                -162.6 us / -10.11%
+```
+
+The 1-cycle result is only a smoke, not a final performance claim, but it
+confirms the code path is live.
+
+Representative direct section profile, tokens=320:
+
+```text
+setting              rank  topk_remap  metadata  dispatch_receiver
+block_both_64        0     93.1 us     42.9 us   204.1 us
+block_both_64        1     100.9 us    47.1 us   221.0 us
+block_fixed_both_64  0     8.5 us      5.4 us    80.1 us
+block_fixed_both_64  1     8.8 us      5.6 us    81.0 us
+```
+
+The fixed remap section now measures only the Python section wrapper and
+assert/pass overhead. The remaining fixed-capacity work is mostly dispatch
+wait/unpack/post-quant and expert compute; the explicit top-k remap kernel is
+no longer on the receiver path.

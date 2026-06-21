@@ -240,6 +240,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         expert_map: torch.Tensor | None,
         device: torch.device,
     ) -> tuple[int, torch.Tensor | None]:
+        if envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH:
+            return (
+                local_num_experts,
+                self._get_local_expert_map(device, local_num_experts),
+            )
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or self._preserve_raw_local_ids
         )
@@ -279,13 +284,20 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         ):
             raise ValueError(
                 "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH currently requires "
-                "generic global expert IDs."
+                "the standard DeepEP HT expert assignment path without "
+                "local-ID or direct-assignment overrides."
             )
         if not envs.VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS:
             raise ValueError(
                 "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires "
                 "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1 so padded "
                 "top-k rows are filtered downstream."
+            )
+        if envs.VLLM_MOE_TRITON_W2_REDUCE_FUSION:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires "
+                "VLLM_MOE_TRITON_W2_REDUCE_FUSION=0 so invalid top-k slots "
+                "are filtered by the ignore-invalid reduction path."
             )
         if tokens.dtype != torch.bfloat16:
             raise ValueError(
@@ -298,6 +310,14 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires an explicit "
                 "positive VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS. "
                 "Use max_tokens_per_dp_rank * dp_size for static buckets."
+            )
+        min_ignore_tokens = envs.VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS
+        if min_ignore_tokens > num_worst_tokens:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH requires "
+                "VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS to be "
+                f"no greater than the fixed capacity ({num_worst_tokens}), "
+                f"got {min_ignore_tokens}."
             )
 
         required_tokens = tokens.size(0)
@@ -335,6 +355,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         has_scales = token_scales is not None
+        if envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH and rank_topk_ids.size(1) != 8:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH currently requires "
+                f"top_k=8, got {rank_topk_ids.size(1)}."
+            )
 
         # Capture a DeepEP event on the compute stream before yielding.
         # This must happen before the yield so the event only covers this
@@ -439,33 +464,35 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         use_local_expert_ids = (
             envs.VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS or use_direct_assignment
         )
-        # When direct assignment is enabled, preserve DeepEP HT's raw local IDs.
-        # The direct assignment path handles -1 invalid entries directly;
-        # generic fallback remaps them immediately before alignment.
-        if not use_direct_assignment and use_local_expert_ids:
-            local_num_experts = len(expert_num_tokens_per_expert_list)
-            expert_topk_ids = remap_deepep_ht_topk_ids(
-                expert_topk_ids,
-                local_num_experts,
-                0,
-            )
-        elif not use_direct_assignment:
-            # The existing MOE kernels assume that all entries of topk_ids are
-            # valid. To that effect, set the -1s in expert_topk_ids to some
-            # expert outside this rank so the expert_map can remap it to -1.
-            # With Expert Parallel, the experts are divided amongst the rank
-            # sequentially. For rank 0, set it to num_experts - 1 and for all
-            # other ranks set it to 0 as we know that expert_map will have a
-            # -1 in those regions for those ranks.
-            #
-            # DeepEP's topk_ids output refers to the local experts directly.
-            # Offset the topk_ids to move it back to the global experts space.
-            invalid_expert_id = num_experts - 1 if self.rank_expert_offset == 0 else 0
-            expert_topk_ids = remap_deepep_ht_topk_ids(
-                expert_topk_ids,
-                invalid_expert_id,
-                self.rank_expert_offset,
-            )
+        # Fixed-capacity and direct assignment both preserve DeepEP HT's raw
+        # local IDs. Alignment skips -1 padded rows directly.
+        if not fixed_capacity_dispatch:
+            if not use_direct_assignment and use_local_expert_ids:
+                local_num_experts = len(expert_num_tokens_per_expert_list)
+                expert_topk_ids = remap_deepep_ht_topk_ids(
+                    expert_topk_ids,
+                    local_num_experts,
+                    0,
+                )
+            elif not use_direct_assignment:
+                # The existing MOE kernels assume that all entries of topk_ids are
+                # valid. To that effect, set the -1s in expert_topk_ids to some
+                # expert outside this rank so the expert_map can remap it to -1.
+                # With Expert Parallel, the experts are divided amongst the rank
+                # sequentially. For rank 0, set it to num_experts - 1 and for all
+                # other ranks set it to 0 as we know that expert_map will have a
+                # -1 in those regions for those ranks.
+                #
+                # DeepEP's topk_ids output refers to the local experts directly.
+                # Offset the topk_ids to move it back to the global experts space.
+                invalid_expert_id = (
+                    num_experts - 1 if self.rank_expert_offset == 0 else 0
+                )
+                expert_topk_ids = remap_deepep_ht_topk_ids(
+                    expert_topk_ids,
+                    invalid_expert_id,
+                    self.rank_expert_offset,
+                )
 
         # Makes a GPU-CPU copy.
         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
@@ -529,6 +556,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.ReceiverType:
+        if envs.VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH and apply_router_weight_on_input:
+            raise ValueError(
+                "VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH does not support "
+                "apply_router_weight_on_input=True."
+            )
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             # TODO: this only works for topK=1, will need to update for topK>1
