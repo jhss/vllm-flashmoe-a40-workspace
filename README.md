@@ -4,10 +4,11 @@
 profiling 기반으로 재구성하여, synthetic Qwen3-like MoE forward에서
 **paired latency 14.2~15.5% 개선**을 달성한 실험 기록이다.
 
-> 한 줄 요약: 새 GEMM 커널을 만든 게 아니라, **post-routing의 실제 expert workload를
-> 분석해 W13/W2 tile(`BLOCK_M`)과 schedule을 공동 선택**한 것이 개선의 큰 덩어리이고,
-> 그 위에 **non-local invalid route 제거**와 **fixed-capacity receive + raw
-> local-expert-id alignment**를 얹은, A100-specific DeepEP HT MoE fast-path 재구성이다.
+> 한 줄 요약: 새 GEMM 커널을 만든 게 아니라, **post-routing workload를 프로파일링해 이 shape에
+> 맞는 `BLOCK_M=64`를 찾아 W13/W2에 고정 적용**(runtime routing-aware selector가 아니라
+> profile-guided, shape-specific 선택)한 것이 개선의 큰 덩어리이고, 그 위에 **non-local
+> invalid route 제거**와 **fixed-capacity receive + raw local-expert-id alignment**를 얹은,
+> A100-specific DeepEP HT MoE fast-path 재구성이다.
 
 ---
 
@@ -23,8 +24,13 @@ intermediate=768, 3 seed × 4 cycle = 12 paired run/조건):
 
 - 두 token size 모두 **12/12 paired 승리** + 모든 seed-level median에서 baseline을 이김
   (3 routing seed × 4 cycle; 같은 seed의 반복은 상관되므로 독립 12회 시행은 아님)
-- 최적화가 **분산도 축소**: 320t IQR 86.5 → 21.1 μs, 최악 케이스도 −206.7 μs(여전히 승리)
-- correctness: 모든 케이스 `assert_close` 통과, max_abs = 0.00195312 (= 2⁻⁹, BF16 ULP 바닥)
+- 이 측정에서는 run-level IQR도 86.5 → 21.1 μs(320t)로 감소
+- correctness: 모든 케이스 `assert_close` 통과 (rtol=1.6e-2, atol=1.0e-2),
+  max_abs = 0.00195312, relative L2 0.0032~0.0038
+
+> 개선율 계산: 각 run은 warmup 20회 후 100 forward의 CUDA-event 평균을 rank별로 재고,
+> 두 rank 중 느린 쪽을 critical path로 쓴다. 표의 latency는 12개 run-level 값의 median이며,
+> 개선율은 `median(paired delta) / median(baseline)`이라 표의 median을 직접 나눈 값과 약간 다르다.
 
 원본 데이터: [`vllm/benchmarks/results/deepep_ht_final_cumulative_ablation_20260621_3seed_summary.md`](vllm/benchmarks/results/deepep_ht_final_cumulative_ablation_20260621_3seed_summary.md)
 
@@ -120,7 +126,8 @@ tile 선택이며, 이를 숨기지 않고 명시한다. (절댓값이 세션마
 | rank 128/512 target_rank=0 | 0.00195312 | 0.00322 | ✅ |
 | rank 128/512 target_rank=1 | 0.00195312 | 0.00322 | ✅ |
 
-- 오차가 모든 케이스에서 정확히 BF16 ULP(2⁻⁹) 바닥 → 누적 오차가 아니라 반올림 한계
+- tolerance: `rtol=1.6e-2, atol=1.0e-2` (benchmark 기본값). 관측 max_abs 0.00195312,
+  rel_l2 0.0032~0.0038로 tolerance 안에서 통과
 - balanced / 비대칭 rank token / target-rank 집중 routing 등 분포 edge case 커버
 - alignment regression: `pytest tests/kernels/moe/test_moe_align_block_size.py` → **477 passed**
 
@@ -155,8 +162,8 @@ tile 선택이며, 이를 숨기지 않고 명시한다. (절댓값이 세션마
 |---|---|---|
 | Triton in-place top-k remap | receiver remap 0.089→0.049 ms, full fwd 1.414→1.386 ms | 작은 승리, 단독으론 약함 |
 | AG/RS in-place combine (`out=`) | finalize 0.120→0.101 ms, full fwd 노이즈 | alloc/copy는 병목 아님 (NCCL latency 지배) |
-| DeepEP HT direct-assignment kernel | 성능 중립 | `recv_x`가 expert-contiguous가 아니라 align 비용이 안 줄어듦 |
-| local-expert-id 공간 assignment | 성능 중립 | 위와 동일 이유 |
+| local-expert-id generic path | 거의 성능 중립 | ID 공간 축소만으로는 schedule/GEMM 비용이 안 줄어듦 |
+| DeepEP HT direct-assignment builder | **회귀** (모든 token size에서 baseline보다 느림; experts 구간 ~254us↑, direct+ignore도 ~71us 느림) | 병목은 GEMM이 아니라 prefix-sum·allocation·다수의 작은 CUDA op/launch로 구성된 **builder 고정 비용** |
 | W2 atomic epilogue reduce (BF16 direct) | max_abs≈0.295, 정확도 실패 | 폐기. FP32 workspace는 정확하나 더 느림 |
 | A100 BF16 specialized kernel-body | 정확하나 더 안 빠름 | generic kernel의 branch가 이미 constexpr 제거됨 |
 
@@ -167,8 +174,12 @@ tile 선택이며, 이를 숨기지 않고 명시한다. (절댓값이 세션마
 ## 재현
 
 ```bash
-# baseline (original)
+# baseline (original) — 이전 shell 환경을 물려받지 않도록 관련 flag를 명시적으로 0
 NCCL_P2P_DISABLE=0 VLLM_DEEPEP_HT_NUM_SMS=24 \
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=0 \
+  VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE=0 \
+  VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE=0 \
+  VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH=0 \
   python vllm/benchmarks/kernels/benchmark_moe_ep_a40.py \
   --world-size 2 --backend deepep_high_throughput \
   --tokens 320 --hidden-size 2048 --intermediate-size 768 \
@@ -176,8 +187,12 @@ NCCL_P2P_DISABLE=0 VLLM_DEEPEP_HT_NUM_SMS=24 \
   --seed 7 --rank-distinct-inputs --input-seed-base 1007 --csv
 
 # final fast path
+#  주의: IGNORE_INVALID_EXPERTS_MIN_TOKENS 기본값은 1024다. 본 워크로드의 received M은
+#  약 638/892라, MIN_TOKENS=0을 주지 않으면 IGNORE_INVALID_EXPERTS=1이어도 filtering이
+#  비활성화되어 결과가 재현되지 않는다.
 NCCL_P2P_DISABLE=0 VLLM_DEEPEP_HT_NUM_SMS=24 \
   VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS=1 \
+  VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS=0 \
   VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE=64 \
   VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE=64 \
   VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH=1 \
@@ -188,11 +203,13 @@ NCCL_P2P_DISABLE=0 VLLM_DEEPEP_HT_NUM_SMS=24 \
   --tokens 320 --hidden-size 2048 --intermediate-size 768 \
   --num-experts 128 --top-k 8 --warmup 20 --iters 100 \
   --seed 7 --rank-distinct-inputs --input-seed-base 1007 --csv
+# tokens=448 은 --tokens 448 + VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS=896 으로 실행
 ```
 
 전체 ablation 명령: [`...cumulative_ablation_20260621_3seed_commands.log`](vllm/benchmarks/results/deepep_ht_final_cumulative_ablation_20260621_3seed_commands.log)
 
-> 환경 세팅은 [`AGENTS.md`](AGENTS.md)의 `uv` 기반 절차를 따른다 (system python/pip 금지).
+> 환경 세팅은 [`vllm/AGENTS.md`](vllm/AGENTS.md)의 `uv` 기반 절차를 따른다 (system python/pip 금지).
+> (루트 `AGENTS.md`는 워크스페이스 운영 메모이고, 빌드/테스트 절차는 `vllm/AGENTS.md`에 있다.)
 
 ---
 
@@ -200,28 +217,45 @@ NCCL_P2P_DISABLE=0 VLLM_DEEPEP_HT_NUM_SMS=24 \
 
 ```text
 vllm/                                       # vLLM fork (실험 본체)
-  vllm/envs.py                              # 모든 opt-in feature flag
+  vllm/envs.py                              # opt-in feature flag 정의
   vllm/model_executor/layers/fused_moe/
-    prepare_finalize/deepep_ht.py           # DeepEP HT receiver/remap/fast path
-    moe_align_block_size.py                 # expert assignment schedule
-    experts/triton_moe.py                   # W13/W2 GEMM config override
+    prepare_finalize/deepep_ht.py           # DeepEP HT receiver / fixed-capacity / raw-local
+    moe_align_block_size.py                 # expert assignment schedule (Python)
+    experts/triton_moe.py                   # invalid filtering / BLOCK_M override / assignment 재사용
+  csrc/libtorch_stable/moe/moe_align_sum_kernels.cu  # CUDA align: raw local id / -1 직접 skip
   benchmarks/kernels/benchmark_moe_ep_a40.py  # 메인 paired benchmark + section profiler
-  benchmarks/results/                       # raw CSV, JSON, summary (모든 측정 근거)
+  benchmarks/results/                       # raw CSV / JSON / summary (모든 측정 근거)
   docs/design/multi_gpu_kernels_ko.md       # vLLM multi-GPU 실행 구조 top-down 설명
-architecture.html                           # 인터랙티브 다이어그램 (브라우저에서 열기)
-architecture.md                             # 위 다이어그램의 텍스트 설명
+architecture.html / architecture.md         # ⚠ 초기 버전 다이어그램 (최종 경로와 다름 — 갱신/삭제 예정)
 ```
 
-### 주요 feature flag (전부 기본 off, 좁은 조건에서만 활성)
+### 주요 코드 변경
 
-| flag | 역할 |
+kernel-level 기여가 드러나도록 핵심 파일을 정리한다.
+
+| 기여 | 주요 파일 |
 |---|---|
-| `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS` | invalid(non-local) route를 GEMM schedule에서 제거 |
-| `VLLM_MOE_TRITON_W1/W2_BLOCK_SIZE_M_OVERRIDE` | W13/W2 tile `BLOCK_SIZE_M` override (schedule 공유) |
-| `VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH` | 고정 용량 receive (CPU metadata dependency 축소) |
-| `VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS` | raw local id/`-1` 직접 alignment (remap 제거) |
-| `VLLM_DEEPEP_HT_TRITON_TOPK_REMAP` | (early) Triton in-place top-k remap |
-| `VLLM_MOE_TRITON_W1/W2_A100_TUNED_CONFIG` | (early) A100 SM80 전용 meta config |
+| invalid filtering / `BLOCK_M` override / assignment 재사용 | `vllm/.../fused_moe/experts/triton_moe.py` |
+| fixed-capacity receive / raw-local contract | `vllm/.../fused_moe/prepare_finalize/deepep_ht.py` |
+| raw local id / `-1` 직접 skip (CUDA align) | `vllm/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu` |
+| alignment regression test (477 passed) | `vllm/tests/kernels/moe/test_moe_align_block_size.py` |
+| paired benchmark + section profiler | `vllm/benchmarks/kernels/benchmark_moe_ep_a40.py` |
+
+### 주요 feature flag
+
+opt-in이 대부분이지만 전부 off는 아니다 (아래 default 열 참고). 좁은 조건에서만 효과가 있다.
+
+| flag | default | 역할 |
+|---|---:|---|
+| `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS` | 0 | invalid(non-local) route를 GEMM schedule에서 제거 |
+| `VLLM_MOE_TRITON_EP_IGNORE_INVALID_EXPERTS_MIN_TOKENS` | 1024 | filtering이 켜지는 received-M 임계값 (본 워크로드선 0으로 낮춰야 활성) |
+| `VLLM_MOE_TRITON_W1_BLOCK_SIZE_M_OVERRIDE` | 0 | W13 tile `BLOCK_SIZE_M` override |
+| `VLLM_MOE_TRITON_W2_BLOCK_SIZE_M_OVERRIDE` | 0 | W2 tile `BLOCK_SIZE_M` override (W13과 같으면 schedule 공유) |
+| `VLLM_DEEPEP_HT_FIXED_CAPACITY_DISPATCH` | 0 | 고정 용량 receive (CPU metadata dependency 축소) |
+| `VLLM_DEEPEP_HT_FIXED_CAPACITY_RAW_LOCAL_IDS` | **1** | fixed-capacity 활성 시 raw-local submode (상위 DISPATCH가 off면 무효) |
+| `VLLM_DEEPEP_HT_FIXED_CAPACITY_NUM_WORST_TOKENS` | 0 | fixed-capacity 용량 (0이면 자동, 본 실험은 640/896 명시) |
+| `VLLM_DEEPEP_HT_TRITON_TOPK_REMAP` | 0 | (early) Triton in-place top-k remap |
+| `VLLM_MOE_TRITON_W1_A100_TUNED_CONFIG` / `..._W2_...` | 0 | (early) A100 SM80 전용 meta config |
 
 ---
 
