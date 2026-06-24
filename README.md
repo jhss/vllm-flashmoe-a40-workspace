@@ -226,7 +226,7 @@ vllm/                                       # vLLM fork (실험 본체)
   benchmarks/kernels/benchmark_moe_ep_a40.py  # 메인 paired benchmark + section profiler
   benchmarks/results/                       # raw CSV / JSON / summary (모든 측정 근거)
   docs/design/multi_gpu_kernels_ko.md       # vLLM multi-GPU 실행 구조 top-down 설명
-architecture.html / architecture.md         # ⚠ 초기 버전 다이어그램 (최종 경로와 다름 — 갱신/삭제 예정)
+architecture.html / architecture.md         # 인터랙티브 다이어그램: 실행 과정 + 최적화 (Baseline↔Optimized 토글)
 ```
 
 ### 주요 코드 변경

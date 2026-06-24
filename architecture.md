@@ -1,121 +1,78 @@
-# vLLM Multi-GPU MoE EP — 최적화 경로 다이어그램
+# DeepEP HT MoE — 실행 과정 & 최적화 (다이어그램 설명)
 
-작성일: 2026-06-22
+`architecture.html`(인터랙티브 다이어그램)의 텍스트 설명. vLLM **DeepEP High-Throughput
+MoE Expert-Parallel** forward의 전체 실행 경로와, 이번 프로젝트가 재구성한 fast path를
+보여준다. **Baseline ↔ Optimized** 모드 토글로 각 단계의 전/후를 비교한다.
 
-이 문서는 `architecture.html`(인터랙티브 다이어그램)의 텍스트 설명이다. 이번
-A100 SXM MoE Expert Parallel 실험의 커밋들이 **multi-GPU MoE 추론의 어느
-단계를, 어떻게 최적화했는지**를 forward 경로 위에 표시한다.
+- 환경: 2×A100-SXM, BF16, top-k=8, 128 experts, hidden=2048, intermediate=768, tokens 320/448
+- 결과(paired same-session): **−15.51% (320t) / −14.22% (448t)**, 12/12 paired win
 
-- 입력: `architecture.html` (브라우저에서 열기)
-- 모드 토글: **Baseline ↔ Optimized** — 각 단계의 최적화 전/후 코드와 latency가 함께 바뀐다
-- 실험 조건: synthetic Qwen3-like BF16, 2×A100-SXM4-80GB, hidden=2048,
-  intermediate=768, experts=128, top-k=8, tokens=128~1024
-
-## 여는 법
-
-```bash
-# Windows
-start architecture.html
-# macOS
-open architecture.html
-# Linux
-xdg-open architecture.html
-```
-
-단축키: `Space` 재생/정지 · `←`/`→` step · `1`–`3` flow · `O` 모드 · `T` 테마 ·
-`F` 전체화면 · `R` 레이아웃 리셋 · 노드를 드래그하면 위치 이동.
+여는 법: 브라우저에서 `architecture.html` 열기. 단축키: `Space` 재생, `←/→` step,
+`1`/`2` flow, `O` 모드(Baseline/Optimized), `T` 테마, `F` 전체화면.
 
 ---
 
-## 노드 (컴포넌트)
+## 노드 (실행 단계)
 
 | 노드 | 역할(색) | 의미 |
 |---|---|---|
-| Client | 요청(mint) | API request, 생성 결과 수신 |
-| GPU Worker | Scheduler/Worker(sky) | rank-local model runner forward |
-| TP Attention | 연산 커널(magenta) | ColumnParallel qkv → head attention → RowParallel o_proj → all-reduce |
-| Router | Router/Assign(amber) | gate GEMM → top-k=8 → topk_ids / topk_weights |
-| Dispatch | 통신(violet) | DeepEP HT / AG-RS, token을 expert 소유 rank로 all-to-all |
-| **Receiver Remap ★** | remap(orange) | local→global expert id 변환 — **최적화 ①** |
-| Expert Assign | Router/Assign(amber) | `moe_align_block_size` → sorted_token_ids / expert_ids |
-| **Expert GEMM ★** | 연산 커널(magenta) | W13 → SiLU·gate → W2 fused_moe_kernel — **최적화 ②** |
-| **Combine ★** | 통신(violet) | top-k reduce + reduce-scatter combine — **최적화 ③** |
-| Sampler | Scheduler/Worker(sky) | lm_head → logits → sampling |
+| Router | embed | gate → top-k=8 → topk_ids/topk_weights |
+| Dispatch | vector(통신) | DeepEP HT all-to-all, token을 expert 소유 rank로 |
+| **Receiver ★** | seed(주황) | recv_x / recv_topk_idx(local id·−1). **최적화 핵심** |
+| **Assignment ★** | embed | moe_align → sorted_token_ids 등 GEMM schedule |
+| **Expert GEMM ★** | compute | W13 → SiLU·gate → W2 (fused_moe_kernel ×2) |
+| Combine | vector(통신) | top-k weighted reduce-scatter |
 
-★ = 이번 커밋이 손댄 최적화 지점.
+★ = mode(Baseline/Optimized)에 따라 동작이 바뀌는 최적화 지점.
 
 ---
 
-## Flow 1 — 전체 forward 경로
+## Flow 1 — 전체 실행 과정 (DeepEP HT MoE forward)
 
-request가 어떻게 rank-local forward가 되고, MoE를 거쳐 token으로 나오는지 top-down.
+router → dispatch → receiver → assignment → expert GEMM → combine. 모드 토글로 전/후 비교.
 
-1. **요청 → rank-local forward** (`client → worker`): scheduler가 batch를 GPU worker로.
-   GPU마다 worker process 1개, 각자 자기 rank의 forward 실행.
-2. **TP Attention block** (`worker → attn`): ColumnParallel qkv → rank-local head
-   attention → RowParallel o_proj → TP all-reduce.
-3. **MoE layer 진입 · Router** (`attn → router`): gate → router_logits → top-k=8.
-4. **Dispatch (EP all-to-all)** (`router → dispatch`): token을 expert 소유 rank로.
-   EP 시 rank0=expert 0~63, rank1=64~127.
-5. **Expert compute (W13 → W2)** (`dispatch → experts`): rank-local expert GEMM.
-   - Baseline: Triton base config, 2GPU EP full forward(t=1024) ~1763 us
-   - Optimized: A100 tuned config, ~1613 us (**~8% ↓**)
-6. **Finalize / Combine** (`experts → combine`): top-k weight 적용 후 reduce-scatter.
-   - Baseline: `output.copy_(tmp)`, finalize 0.120 ms
-   - Optimized: `combine(out=output)` in-place, finalize 0.101 ms
-7. **Sampling** (`combine → sampler`): lm_head → logits → next token.
-8. **Response** (`sampler → client`): token 반환 (decode면 반복).
+1. **Dispatch (all-to-all)** (`router → dispatch`): top-k=8 선택 후 token을 expert 소유
+   rank로 보냄. 128 experts를 2 rank가 64개씩 소유.
+2. **Receiver ★** (`dispatch → receive`): recv_x + recv_topk_idx(local id / −1) 수신.
+   - Baseline: dynamic receive + local→global **remap**
+   - Optimized: **fixed-capacity**(capacity = tokens×world_size = 640/896) + **raw local id**(remap 없음). 실제 recv ≈ 638/892 → 활용률 ~99%
+3. **Assignment ★** (`receive → align`): GEMM schedule 생성.
+   - Baseline: generic align, invalid(non-local) block 포함, W13/W2 schedule 2번
+   - Optimized: `IGNORE_INVALID_EXPERTS=1`(+`MIN_TOKENS=0`), CUDA align이 raw local id/−1 직접 skip, BLOCK_M=64로 W13/W2 schedule 공유
+4. **Expert GEMM ★** (`align → experts`): W13 → silu_and_mul → W2.
+   - Baseline: `BLOCK_M=128`
+   - Optimized: `BLOCK_M=64` (profile-guided, shape-specific) — W2 단독 ~−25%, compute 전체 −10~12%
+5. **Finalize / Combine** (`experts → combine`): top-k weighted reduce-scatter → 다음 layer로.
 
-## Flow 2 — MoE EP block (DeepEP HT 상세)
+## Flow 2 — 최적화한 부분 (기여 + 결과)
 
-MoE receiver 경로를 5단계로 확대. 이번 실험의 무대.
+각 최적화가 어디 살고 얼마나 기여했는지 + 최종 결과.
 
-1. **Router top-k 선택** (`router → dispatch`): topk_ids [128,8], topk_weights [128,8].
-2. **DeepEP HT dispatch (all-to-all)** (`dispatch → remap`): `recv_x`(token 목록)와
-   `recv_topk_idx`(local id / -1 혼재)를 받음. recv_x는 expert-contiguous가 아님.
-3. **① Receiver top-k remap ★** (`remap → assign`): local→global id 변환.
-   - Baseline: `torch.where`(새 tensor) — 0.089 ms
-   - Optimized: Triton in-place (`VLLM_DEEPEP_HT_TRITON_TOPK_REMAP=1`) — 0.049 ms (~40us ↓)
-4. **② Expert assignment** (`assign → experts`): `moe_align_block_size`로
-   sorted_token_ids / expert_ids / num_tokens_post_padded 생성. recv_x가
-   expert-contiguous가 아니라 align 비용이 핵심 — `VLLM_DEEPEP_HT_LOCAL_EXPERT_IDS`
-   실험이 성능 중립이었던 이유 (다음 단계는 DeepEP HT 전용 assignment kernel).
-5. **③ Expert GEMM + Combine ★** (`experts → combine`): W13 → SiLU·gate → W2 후 combine.
-   - Baseline: base config + copy combine — finalize 0.120 ms
-   - Optimized: A100 tuned config + in-place combine — expert ~8% ↓, finalize 0.101 ms
-
-## Flow 3 — 최적화 포인트
-
-이번 커밋이 손댄 3곳만 모은 tour. 모드 토글로 전/후 비교.
-
-1. **① DeepEP HT top-k remap** (`dispatch → remap`):
-   `VLLM_DEEPEP_HT_TRITON_TOPK_REMAP` — receiver remap 0.089→0.049 ms,
-   full forward 1.414→1.386 ms.
-2. **② W1/W2 A100 tuned config** (`remap → experts`):
-   `VLLM_MOE_TRITON_W1/W2_A100_TUNED_CONFIG` — SM80 BF16 t≥1024 전용, W2 단독 -25%,
-   2GPU EP ~8%. correctness max_abs=0.
-3. **③ AG/RS in-place combine** (`experts → combine`):
-   `reduce_scatterv(out=output)` — finalize 0.120→0.101 ms (full forward는
-   NCCL collective latency가 지배라 노이즈 수준).
+1. **③ Receiver fast path** (`receive`): fixed-capacity + raw-local.
+   - 단독 fixed-capacity(remap 유지)는 **+2.12% / +2.30% 회귀**, raw-local까지 더해야 −6.17%/−6.47% → net receiver 기여 약 **−3.6~4.3%**. ("절반만 적용하면 안 되는" 의존성)
+2. **① Invalid-route filtering** (`align`): non-local route(top-k=8에서 pair의 ~50%)가 만들던
+   invalid GEMM block 제거. filtering만 **−2.65% / −3.34%** (commit `001b3cb`).
+3. **② BLOCK_M=64 tile — 가장 큰 레버** (`experts`): filtering 위에 BLOCK_M=64를 더하면
+   compute 이득의 대부분. `−2.65% → −12.87%`(320t), `−3.34% → −10.52%`(448t).
+   runtime selector가 아니라 이 shape에서 찾은 값을 고정 적용.
+4. **= 최종 결과** (`combine`): 누적 **−15.51% / −14.22%**, 12/12 paired,
+   correctness `assert_close` 통과(rtol=1.6e-2, max_abs 0.00195312), alignment 477 passed.
 
 ---
 
-## Baseline ↔ Optimized 모드 차이
+## Baseline ↔ Optimized 요약
 
-| 단계 | Baseline | Optimized | flag |
-|---|---|---|---|
-| Receiver remap | `torch.where` 0.089 ms | Triton in-place 0.049 ms | `VLLM_DEEPEP_HT_TRITON_TOPK_REMAP` |
-| Expert GEMM | base cfg, 2GPU EP ~1763 us | A100 tuned, ~1613 us (~8%↓) | `VLLM_MOE_TRITON_W1/W2_A100_TUNED_CONFIG` |
-| Combine | alloc + copy, 0.120 ms | in-place reduce-scatter, 0.101 ms | `combine(out=output)` |
+| 단계 | Baseline | Optimized |
+|---|---|---|
+| Receiver | dynamic recv + local→global remap | fixed-capacity + raw local id (remap 없음) |
+| Assignment | generic align, invalid 포함, schedule ×2 | raw-local align, invalid skip, BLOCK_M=64 schedule 공유 |
+| Expert GEMM | BLOCK_M=128 | BLOCK_M=64 (가장 큰 레버) |
 
-## 핵심 메시지
+## 주의 / 한계
 
-- **decode**: communication / launch floor가 병목 (작고 sparse한 expert batch).
-- **prefill**: expert GEMM(`fused_moe_kernel`)과 kernel boundary가 병목.
-- receiver remap은 작은 승리, in-place combine은 노이즈 수준, **W1/W2 config tuning이
-  지금까지 가장 큰 단일 승리(~8%)**.
-- 다음 방향: DeepEP HT 전용 expert-assignment kernel, prefill 전용 fusion
-  (GEMM2 epilogue + top-k reduce), AG/RS communication–compute overlap.
+- synthetic MoE forward, 단일 shape(tokens 320/448), EP=2, top-k=8. 실모델/실서빙/높은 EP는 미검증.
+- fixed-capacity 용량은 routing oracle이 아니라 `tokens×world_size` worst-case 상한이며,
+  본 워크로드는 활용률 ~99%로 유리했다 (높은 EP/낮은 top-k에선 활용률 하락 가능).
+- compute 이득의 대부분은 BLOCK_M=64(tile)이고, invalid filtering은 ~2.6~3.3%로 작다.
 
-> 주의: latency 수치는 매 section마다 synchronize를 넣는 section profiler 기준으로,
-> 상대적 병목 위치 파악용이다. 절대 end-to-end serving latency와는 다르다.
+전체 측정 근거: `vllm/benchmarks/results/`. 자세한 서사는 저장소 루트 `README.md`.
